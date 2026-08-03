@@ -108,6 +108,11 @@ class Frame:
         self.data = np.clip(scaled, 0, 255).astype(np.uint8)
 
     # --- text ---
+    #
+    # Every text method takes an optional ``face``. Omitting it draws with the
+    # panel's 3x5 font, which is what every call site wanted before the 5x7
+    # face existed; the scene composers pass the face their layout metrics
+    # chose for the target.
     def text(
         self,
         x: int,
@@ -117,12 +122,14 @@ class Frame:
         *,
         scale: int = 1,
         tracking: int = 1,
+        face: Optional[font.Font] = None,
     ) -> int:
         """Draw ``value`` with its top-left at ``(x, y)``; return the width drawn."""
+        face = face or font.DEFAULT
         scale = max(1, int(scale))
         cursor = x
-        for char in font.normalize(value):
-            for offset_x, offset_y in font.glyph(char):
+        for char in face.normalize(value):
+            for offset_x, offset_y in face.glyph(char):
                 self.rect(
                     cursor + offset_x * scale,
                     y + offset_y * scale,
@@ -130,7 +137,7 @@ class Frame:
                     scale,
                     color,
                 )
-            cursor += (font.glyph_width(char) + tracking) * scale
+            cursor += (face.glyph_width(char) + tracking) * scale
         return max(0, cursor - x - tracking * scale)
 
     def text_centered(
@@ -143,18 +150,28 @@ class Frame:
         tracking: int = 1,
         left: int = 0,
         right: Optional[int] = None,
+        face: Optional[font.Font] = None,
     ) -> int:
         """Centre text horizontally inside ``[left, right)``."""
+        face = face or font.DEFAULT
         right = self.cols if right is None else right
         span = max(0, right - left)
         # Tighten the letter spacing before truncating: losing the last letters
         # of a headline is a worse outcome than losing a pixel of air between
         # them.
-        if font.text_width(value, scale, tracking) > span and tracking > 0:
+        if face.text_width(value, scale, tracking) > span and tracking > 0:
             tracking = 0
-        value = font.fit(value, span, scale, tracking)
-        width = font.text_width(value, scale, tracking)
-        return self.text(left + (span - width) // 2, y, value, color, scale=scale, tracking=tracking)
+        value = face.fit(value, span, scale, tracking)
+        width = face.text_width(value, scale, tracking)
+        return self.text(
+            left + (span - width) // 2,
+            y,
+            value,
+            color,
+            scale=scale,
+            tracking=tracking,
+            face=face,
+        )
 
     def text_right(
         self,
@@ -165,9 +182,13 @@ class Frame:
         *,
         scale: int = 1,
         tracking: int = 1,
+        face: Optional[font.Font] = None,
     ) -> int:
-        width = font.text_width(str(value), scale, tracking)
-        return self.text(right - width, y, value, color, scale=scale, tracking=tracking)
+        face = face or font.DEFAULT
+        width = face.text_width(str(value), scale, tracking)
+        return self.text(
+            right - width, y, value, color, scale=scale, tracking=tracking, face=face
+        )
 
     # --- sprites ---
     def blit(self, sprite: Sprite, x: int, y: int, *, scale: int = 1) -> None:

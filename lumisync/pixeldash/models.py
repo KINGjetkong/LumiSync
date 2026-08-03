@@ -314,13 +314,27 @@ class RenderTarget:
         return self.cols * self.rows
 
 
-#: Panel geometries Pixel Dash knows how to compose scenes for. Add a size here
-#: and every scene lays itself out against it — the composers read the target,
-#: they do not hard-code 52x32.
+#: Geometries Pixel Dash knows how to compose scenes for. Add a size here and
+#: every scene lays itself out against it — the composers read the target's
+#: layout metrics, they do not hard-code 52x32.
+#:
+#: The ``screen`` sizes exist because a monitor is not a panel. Hardware pixel
+#: count is fixed on an LED matrix, but a hover overlay or a ghost display can
+#: draw as many pixels as you like — so those targets use a denser grid, which
+#: gives the layout room for the 5x7 face and makes the text markedly easier to
+#: read. ``screen`` and ``screen-xl`` are exact 2x and 3x multiples of the
+#: H6631 grid, so a layout checked on one is proportionally identical on the
+#: others.
 KNOWN_TARGETS: Dict[str, RenderTarget] = {
     "H6631": RenderTarget(52, 32, "H6631"),
-    "32x32": RenderTarget(32, 32, "32x32"),
-    "16x16": RenderTarget(16, 16, "16x16"),
-    "16x32": RenderTarget(32, 16, "16x32"),
+    "screen": RenderTarget(104, 64, "screen"),
+    "screen-xl": RenderTarget(156, 96, "screen-xl"),
     "64x32": RenderTarget(64, 32, "64x32"),
+    "32x32": RenderTarget(32, 32, "32x32"),
+    "16x32": RenderTarget(32, 16, "16x32"),
+    "16x16": RenderTarget(16, 16, "16x16"),
 }
+
+#: Default geometry for on-screen surfaces (hover, ghost). Panels keep their
+#: own hardware size; only the screen sinks get the denser grid.
+DEFAULT_SCREEN_TARGET = "screen"

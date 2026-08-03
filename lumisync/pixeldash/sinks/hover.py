@@ -16,6 +16,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Optional, Tuple
 
+from ..models import DEFAULT_SCREEN_TARGET
 from ..render.pipeline import RenderResult
 from .base import Sink, SinkReport
 from .surface import build_surface_class, find_screen, qt_available
@@ -35,6 +36,8 @@ class HoverSink(Sink):
     """A floating, always-on-top pixel dashboard."""
 
     name = "hover"
+    #: Screens are not panels — render this one on the denser grid.
+    target = DEFAULT_SCREEN_TARGET
 
     def __init__(
         self,

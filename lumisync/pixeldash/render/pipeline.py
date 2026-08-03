@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..config import PixelDashConfig
 from ..events import DashEvent
-from ..models import DashboardSnapshot
+from ..models import DashboardSnapshot, RenderTarget
 from . import gif, planner, scenes
 from .canvas import Frame
 from .planner import PlannerHook, ScenePlan
@@ -72,6 +72,7 @@ class RenderResult:
     plan: ScenePlan
     scene_ids: Tuple[str, ...]
     frame_ms: int
+    target: Optional[RenderTarget] = None
     events: Tuple[DashEvent, ...] = field(default_factory=tuple)
     _gif: Optional[bytes] = None
 
@@ -109,6 +110,8 @@ class RenderResult:
             "frame_ms": self.frame_ms,
             "duration_ms": self.duration_ms,
             "scenes": list(self.scene_ids),
+            "target": self.target.name if self.target else "",
+            "size": list(self.target.size) if self.target else [],
             "plan": self.plan.to_json(),
             "plan_source": self.plan.source,
             "events": [
@@ -125,19 +128,31 @@ def render(
     events: Sequence[DashEvent] = (),
     plan: Optional[ScenePlan] = None,
     hook: Optional[PlannerHook] = None,
+    target: Optional[RenderTarget] = None,
 ) -> RenderResult:
     """Compose the full animation for one snapshot.
 
     Event bursts play first and interrupt the rotation — a fill that just
     printed matters more than the calendar. The rotation then plays in the
     order the plan specifies.
+
+    ``target`` overrides the config's panel geometry. The same snapshot is
+    commonly rendered twice per tick — once at the panel's hardware size and
+    once at a denser grid for the screen surfaces — and the target is folded
+    into the digest so those two renders are distinguishable.
     """
     events = tuple(events)
+    resolved_target = target or config.target
     resolved_plan = plan if plan is not None else planner.plan(snapshot, config, hook=hook)
-    digest = snapshot_digest(snapshot, extra=[event.key for event in events])
+    digest = snapshot_digest(
+        snapshot,
+        extra={"events": [event.key for event in events], "target": resolved_target.name},
+    )
     rng = random.Random(seed_from(digest))
 
-    context = scenes.build_context(snapshot, config, resolved_plan, rng)
+    context = scenes.build_context(
+        snapshot, config, resolved_plan, rng, target=resolved_target
+    )
 
     frames: List[Frame] = []
     for event in events:
@@ -158,6 +173,7 @@ def render(
         plan=resolved_plan,
         scene_ids=scene_ids,
         frame_ms=int(config.frame_ms),
+        target=resolved_target,
         events=events,
     )
 
@@ -181,6 +197,7 @@ def render_event(
         plan=resolved_plan,
         scene_ids=("event",),
         frame_ms=int(config.frame_ms),
+        target=config.target,
         events=(event,),
     )
 

@@ -103,6 +103,77 @@ python -m lumisync.pixeldash check
 
 ---
 
+## Adding an API without writing code
+
+Beyond the built-in brokers, a feed can be **described** rather than programmed.
+Drop a JSON file in `feeds.d` and it appears alongside Tradier and Alpaca — same
+snapshot, same scenes, same fail-closed behaviour.
+
+```
+<output_dir>/feeds.d/myprop.json
+```
+
+```json
+{
+  "name": "myprop",
+  "base_url": "https://api.example.com",
+  "data_class": "live",
+  "auth": {"type": "bearer", "token_env": "MYPROP_TOKEN"},
+  "positions": {
+    "path": "/v1/positions",
+    "records": "data.rows",
+    "fields": {
+      "symbol": "ticker",
+      "quantity": "qty",
+      "entry_price": "avg_price",
+      "mark_price": "last"
+    }
+  },
+  "trades": {
+    "path": "/v1/fills",
+    "records": "data.rows",
+    "params": {"start": "{since}", "end": "{until}"},
+    "mode": "fills",
+    "fields": {
+      "symbol": "ticker", "side": "side", "quantity": "qty",
+      "price": "px", "filled_at": "ts"
+    }
+  }
+}
+```
+
+`python -m lumisync.pixeldash check` lists every spec it found and every spec it
+rejected, with the reason.
+
+| Key | Meaning |
+|---|---|
+| `base_url` | Host the paths hang off |
+| `data_class` | `live` / `paper` / `backtest` — drives the panel's chip |
+| `auth.type` | `none`, `bearer`, `header`, `query`, `basic` |
+| `auth.token_env` | **Name** of the env var holding the credential |
+| `records` | Dotted path to the list in the response (`data.rows`) |
+| `fields` | Pixel Dash field → response field, dotted paths allowed |
+| `params` | Query string; `{since}` and `{until}` are substituted |
+| `mode` | `closed` for a realized ledger, `fills` for a fill stream |
+
+Three properties are enforced rather than suggested:
+
+**Credentials never live in the spec.** `token_env` names an environment
+variable; the file holds the variable's name, never its value, so a spec is safe
+to commit and share. A spec that tries to inline a token is rejected at load.
+
+**A spec cannot invent a number.** Every value is read from the response or it
+is `None`. A missing mark renders as `--` and the account total is refused —
+exactly as it would from Tradier.
+
+**Validation happens at load, not at poll.** Unknown field names, bad auth
+types, missing paths and duplicate feed names are all rejected with a message
+naming the file. A typo shows up as a startup error, not as a dashboard that is
+quietly missing a feed.
+
+`mode: "fills"` runs the same FIFO matching the Alpaca feed uses, for brokers
+that report executions rather than round trips.
+
 ## Scenes
 
 The rotation is configurable; scenes with nothing to show drop out
@@ -234,23 +305,85 @@ seconds at a time, so ~250 rendered frames usually collapse to a handful of
 distinct images — the difference between a BLE panel keeping up and falling
 over.
 
-#### A note on the Govee Gaming Pixel Light (H6631)
+---
+
+## Getting at the Govee Gaming Pixel Light (H6631)
 
 The H6631 is a 52×32 Wi-Fi pixel panel, which is why that geometry is the
-default render target.
+default render target. Here is exactly what is and is not reachable.
 
-**Govee's documented LAN API covers power, brightness and a single colour. There
-is no published per-pixel surface for it.** So the panel sink resolves to
-`AMBIENT` there and says so — this package will not claim a pixel path it cannot
-verify.
+### What each access path gives you
 
-The working full-resolution route to that panel today is the GIF: the file sink
-writes `dashboard.gif` at 52×32, and the Govee Home app imports GIFs as a DIY
-animation. That is why the file sink is a first-class output rather than a debug
-artifact.
+| Path | What you need | What you get |
+|---|---|---|
+| **Govee Home app** | The app | **Full per-pixel.** Import a GIF or PNG as a DIY scene. Manual, one-off |
+| **Cloud API (v2)** | An API key | Power, brightness, one colour, per-zone colour, and **selecting a saved scene by id**. No image upload |
+| **LAN API** | "LAN Control" enabled in the app | Power, brightness, one colour. Officially nothing more |
+| **BLE** | — | Undocumented; nothing verified for this model |
 
-If a per-pixel transport for the H6631 is confirmed later, adding it is a driver
-that implements `draw_grid()` — `probe()` picks it up with no changes here.
+**There is no documented way to push an arbitrary 52×32 frame to this panel from
+code.** Govee's v2 capability list is `powerSwitch`, `brightness`, `colorRgb`,
+`colorTemperatureK`, `segmentedColorRgb` (≤15 zones), `lightScene`, `diyScene`,
+`snapshot`, `musicMode`. `diyScene` *selects* a scene you already made; it does
+not upload one. This package will not claim a pixel path it cannot verify.
+
+### So what actually works
+
+Two things, and together they cover most of what you'd want:
+
+**1. The GIF (full resolution, manual import).** The file sink writes
+`dashboard.gif` at exactly 52×32. Import it in Govee Home as a DIY scene and the
+real dashboard is on the panel. That is why the file sink is a first-class
+output rather than a debug artifact.
+
+**2. Scene switching (automatic, limited to pictures you pre-made).** Make a DIY
+scene per state you care about — green day, red day, a win, a loss, a dead feed
+— then let the panel switch itself. `tools/govee_scene_bridge.py` watches the
+manifest Pixel Dash writes and activates the matching scene id.
+
+### What you need for the automatic path
+
+```bash
+# 1. Govee Home app -> Profile -> Settings -> Apply for API Key.
+#    It arrives by email, usually within minutes.
+export GOVEE_API_KEY="..."
+
+# 2. Find the device. Prints every device on the account.
+python tools/govee_scene_bridge.py --devices
+export GOVEE_DEVICE_SKU="H6631"
+export GOVEE_DEVICE_ID="..."
+
+# 3. Create the DIY scenes in the app (import the rendered GIFs), then map
+#    their ids. Any state you don't map falls back to a solid colour.
+export GOVEE_SCENE_GREEN=12
+export GOVEE_SCENE_RED=13
+export GOVEE_SCENE_WIN=14
+export GOVEE_SCENE_LOSS=15
+export GOVEE_SCENE_FEED_DOWN=16
+
+# 4. Run it alongside Pixel Dash.
+python tools/govee_scene_bridge.py --watch
+```
+
+Rate limits are 12 requests/second per account and 120/minute per device. The
+bridge holds the last command and skips repeats, so a steady state costs nothing.
+
+### Why the bridge lives in `tools/`
+
+LumiSync's runtime is deliberately cloud-free — *"direct LAN communication, no
+cloud required"* is a promise the package makes and a test enforces. So anything
+that talks to a vendor cloud stays out of `lumisync/` and runs as a separate,
+opt-in process that consumes the manifest:
+
+```
+Pixel Dash  ->  dashboard.json  ->  govee_scene_bridge  ->  Govee cloud API
+```
+
+### If a per-pixel transport turns up
+
+Adding it is a LumiSync driver implementing `draw_grid()`. `probe()` picks it up
+and the panel sink switches from `AMBIENT` to `PIXEL` with no changes to Pixel
+Dash — that is what the capability probe is for.
 
 ---
 
@@ -281,16 +414,47 @@ something else display it.
 
 ---
 
+## Two sizes, because a screen is not a panel
+
+An LED matrix has a fixed pixel count. A hover overlay or a ghost display can
+draw as many pixels as it likes — so the screen surfaces render on a **denser
+grid with physically smaller pixels**, which is what buys room for a larger,
+much more legible face.
+
+| Target | Grid | Font | Used by |
+|---|---|---|---|
+| `H6631` | 52×32 | 3×5 | The panel — hardware resolution |
+| `screen` | 104×64 | **5×7** | Hover overlay, ghost display (default) |
+| `screen-xl` | 156×96 | **5×7** | Larger ghost displays and capture sources |
+| `64x32`, `32x32`, `16x32`, `16x16` | — | 3×5 | Other panels |
+
+`screen` and `screen-xl` are exact 2× and 3× multiples of the H6631 grid, so a
+layout checked on one is proportionally identical on the others.
+
+The service renders **once per geometry any sink asked for** — typically twice
+per tick — and routes each sink to its own. The plan is resolved once and shared
+across both, since it describes the situation rather than the geometry.
+
+Nothing in the scene composers is a pixel constant. Layout comes from
+`render/metrics.py`, computed from the target: font, header height, line height,
+row pitch, calendar cell size, and the scale of the hero number. That is what
+lets the same code lay out on a 16×16 panel and on a 156×96 surface.
+
+The font choice is made on **available rows**, not columns: a wide-but-short
+target that took the 5×7 face on width alone would have room for the letters and
+nowhere to put them.
+
 ## Layout notes
 
-**The font is mostly 3×5, with three exceptions.** `M`, `N` and `W` are 4–5
-pixels wide. A three-pixel `N` either reads as an `S` (draw the diagonal) or as
-an `M` (fill the body), and both mistakes land in words this dashboard shows
+**The panel font is mostly 3×5, with three exceptions.** `M`, `N` and `W` are
+4–5 pixels wide. A three-pixel `N` either reads as an `S` (draw the diagonal) or
+as an `M` (fill the body), and both mistakes land in words this dashboard shows
 constantly: OPEN, DOWN, WIN, MISSION. There is a test asserting those three
-glyphs stay distinct.
+glyphs stay distinct in both faces.
 
 **The `$` symbol is off by default.** It is not separable from `S` at three
-pixels wide, and the sign plus the colour already say what the number is.
+pixels wide, and the sign plus the colour already say what the number is. The
+5×7 face does have a real `$` if you want it.
 
 **Headlines wrap rather than squeeze.** "MISSION FAILED" does not fit one
 52-pixel row; tightening the letter spacing to force it makes the word
@@ -318,10 +482,13 @@ lumisync/pixeldash/
 │   ├── base.py          # Feed interface + JSON-over-HTTPS client
 │   ├── tradier.py       # Positions, gain/loss, balances
 │   ├── alpaca.py        # Positions, fill stream
+│   ├── declarative.py   # Feeds described by a JSON spec
+│   ├── specs.py         # Discover and validate specs in feeds.d
 │   ├── roundtrip.py     # FIFO round-trip reconstruction
 │   └── registry.py      # Config -> feeds, reporting what failed
 ├── render/
-│   ├── font.py          # 3x5 pixel font (M/N/W wider)
+│   ├── font.py          # 3x5 panel face + 5x7 screen face
+│   ├── metrics.py       # Layout measurements derived from the target
 │   ├── palette.py       # Colours tuned for a diffused LED panel
 │   ├── canvas.py        # Frame buffer + drawing primitives
 │   ├── sprites.py       # Trophy, skull, agent avatars, warning, plug
@@ -335,6 +502,8 @@ lumisync/pixeldash/
     ├── ghost.py         # Virtual display surface
     ├── hover.py         # Always-on-top HUD
     └── surface.py       # Shared Qt widget + screen discovery
+
+tools/govee_scene_bridge.py  # Optional, out-of-package Govee cloud bridge
 ```
 
 ## Tests

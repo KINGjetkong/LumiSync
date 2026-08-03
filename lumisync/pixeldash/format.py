@@ -104,11 +104,14 @@ def month_label(date: _dt.date) -> str:
     return date.strftime("%b").upper()
 
 
-def fit_scale(text: str, max_width: int, *, preferred: int = 2, minimum: int = 1) -> int:
+def fit_scale(
+    text: str, max_width: int, *, preferred: int = 2, minimum: int = 1, face=None
+) -> int:
     """Largest font scale from ``preferred`` down to ``minimum`` that fits."""
     from .render import font
 
+    face = face or font.DEFAULT
     for candidate in range(int(preferred), int(minimum) - 1, -1):
-        if font.text_width(text, candidate) <= max_width:
+        if face.text_width(text, candidate) <= max_width:
             return candidate
     return max(1, int(minimum))

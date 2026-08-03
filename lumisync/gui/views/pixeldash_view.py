@@ -32,7 +32,7 @@ from ...pixeldash.config import load_config, setup_instructions
 from ...pixeldash.journal import Journal, default_journal_path
 from ...pixeldash.models import KNOWN_TARGETS
 from ...pixeldash.service import PixelDashService, ServiceTick
-from ...pixeldash.sinks.base import Sink, publish_all
+from ...pixeldash.sinks.base import Sink, group_by_target, publish_all
 from ...pixeldash.sinks.files import FileSink
 from ...pixeldash.sinks.ghost import GhostDisplaySink
 from ...pixeldash.sinks.hover import Corner, HoverSink
@@ -376,6 +376,7 @@ class PixelDashView(QWidget):
         if self.running:
             return
         self.service.config = self.config
+        self.service.sinks = self._active_sinks()
         self._thread = QThread()
         self._worker = _DashWorker(self.service)
         self._worker.moveToThread(self._thread)
@@ -414,6 +415,9 @@ class PixelDashView(QWidget):
         self.refresh_button.setEnabled(False)
         try:
             self.service.config = self.config
+            # The service renders one geometry per attached sink, so it needs
+            # the view's sinks even though the view does the publishing.
+            self.service.sinks = self._active_sinks()
             self._on_tick(self.service.refresh(publish=False))
         finally:
             self.refresh_button.setEnabled(True)
@@ -442,7 +446,17 @@ class PixelDashView(QWidget):
     def _publish(self, tick: ServiceTick) -> None:
         if tick.result is None:
             return
-        reports = publish_all(self._active_sinks(), tick.result)
+
+        # Route each sink to the geometry it asked for. The worker already
+        # rendered every geometry any sink wants, so the hover and ghost
+        # windows get the denser screen grid while the panel keeps hardware
+        # resolution.
+        reports = []
+        for target_name, sinks in group_by_target(
+            self._active_sinks(), self.config.target.name
+        ).items():
+            result = tick.renders.get(target_name, tick.result)
+            reports.extend(publish_all(sinks, result))
         problems = [entry.summary for entry in reports if not entry.ok or entry.degraded]
         if problems:
             self._set_status(" · ".join(problems), error=any(not e.ok for e in reports))

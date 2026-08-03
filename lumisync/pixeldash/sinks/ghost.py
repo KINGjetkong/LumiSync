@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+from ..models import DEFAULT_SCREEN_TARGET
 from ..render.pipeline import RenderResult
 from .base import Sink, SinkReport
 from .surface import build_surface_class, find_virtual_screen, qt_available
@@ -24,6 +25,8 @@ class GhostDisplaySink(Sink):
     """Full-screen surface pinned to a virtual (or explicitly chosen) display."""
 
     name = "ghost"
+    #: Screens are not panels — render this one on the denser grid.
+    target = DEFAULT_SCREEN_TARGET
 
     def __init__(
         self,

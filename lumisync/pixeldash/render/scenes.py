@@ -5,10 +5,12 @@ reads a clock, opens a socket, or calls ``random`` directly; the only source of
 variation is ``context.rng``, which the pipeline seeds from the snapshot digest.
 That is what makes a render reproducible.
 
-Layout is written against ``context.target`` rather than hard-coded to 52x32, so
-the same scenes lay out on a 32x32 or 64x32 panel. Below 32 columns the
-composers switch to a stripped-down variant — a 16x16 panel can show a number
-and a colour, and pretending otherwise just produces mush.
+Layout comes from ``context.metrics``, computed from the target — never from
+pixel constants in this file. That is what lets the same scenes lay out on a
+16x16 panel, on the 52x32 H6631, and on a 156x96 screen surface where the
+denser grid earns the larger 5x7 face. Below 32 columns the composers switch to
+a stripped-down variant: a 16x16 panel can show a number and a colour, and
+pretending otherwise just produces mush.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ from ..models import DashboardSnapshot, DataClass, Position, RenderTarget
 from ..stats import Summary, heat_level, heat_scale, recent_grid, summarize
 from . import sprites
 from .canvas import Frame, hold
+from .metrics import POSITION_ROWS, Metrics, metrics_for
 from .palette import (
     BLACK,
     CYAN,
@@ -40,8 +43,9 @@ from .palette import (
 )
 from .planner import ScenePlan
 
-HEADER_HEIGHT = 6
-BODY_TOP = 8
+#: Longest calendar window, in weeks. Past this the columns are too thin to
+#: read and the window outruns the trader's working memory anyway.
+MAX_CALENDAR_WEEKS = 16
 
 
 @dataclass(frozen=True)
@@ -50,6 +54,7 @@ class SceneContext:
 
     snapshot: DashboardSnapshot
     target: RenderTarget
+    metrics: Metrics
     plan: ScenePlan
     config: PixelDashConfig
     summary: Summary
@@ -66,7 +71,11 @@ class SceneContext:
     @property
     def compact(self) -> bool:
         """True on panels too small for a header and a body."""
-        return self.target.cols < 32 or self.target.rows < 24
+        return self.metrics.compact
+
+    @property
+    def face(self):
+        return self.metrics.face
 
     def blank(self) -> Frame:
         return Frame(self.cols, self.rows, BLACK)
@@ -82,10 +91,20 @@ def build_context(
     config: PixelDashConfig,
     plan: ScenePlan,
     rng: random.Random,
+    *,
+    target: Optional[RenderTarget] = None,
 ) -> SceneContext:
+    """Assemble the context for one render.
+
+    ``target`` overrides the config's panel geometry, which is how the same
+    snapshot renders once at 52x32 for the panel and again at 104x64 for the
+    screen surfaces in a single pass.
+    """
+    resolved = target or config.target
     return SceneContext(
         snapshot=snapshot,
-        target=config.target,
+        target=resolved,
+        metrics=metrics_for(resolved),
         plan=plan,
         config=config,
         summary=summarize(snapshot),
@@ -113,22 +132,23 @@ def chrome(
     if context.compact:
         return
 
+    metrics = context.metrics
+    face = metrics.face
+
     if right_text is None:
         right_text = context.snapshot.data_class.short
         right_color = RED if context.snapshot.data_class is DataClass.LIVE else CYAN
     right_color = right_color or GREY
 
-    from . import font
-
-    right_width = font.text_width(right_text) if right_text else 0
-    title_space = context.cols - right_width - 3
-    frame.text(1, 0, font.fit(title, title_space), context.plan.accent)
+    right_width = face.text_width(right_text) if right_text else 0
+    title_space = metrics.content_width - right_width - 2
+    frame.text(metrics.left, 0, face.fit(title, title_space), context.plan.accent, face=face)
     if right_text:
-        frame.text_right(context.cols - 1, 0, right_text, right_color)
-    frame.hline(0, HEADER_HEIGHT, context.cols, scale_color(context.plan.accent, 0.30))
+        frame.text_right(metrics.right, 0, right_text, right_color, face=face)
+    frame.hline(0, metrics.rule_y, context.cols, scale_color(context.plan.accent, 0.30))
 
 
-def marquee(text: str, width: int, offset: int) -> str:
+def marquee(text: str, width: int, offset: int, face=None) -> str:
     """Window into a horizontally scrolling string.
 
     Returns ``text`` unchanged when it already fits, so short labels never
@@ -136,18 +156,21 @@ def marquee(text: str, width: int, offset: int) -> str:
     """
     from . import font
 
-    if font.text_width(text) <= width:
+    face = face or font.DEFAULT
+    if face.text_width(text) <= width:
         return text
     padded = f"{text}   "
     start = offset % len(padded)
     rotated = padded[start:] + padded[:start]
-    return font.fit(rotated, width)
+    return face.fit(rotated, width)
 
 
 # --- daily --------------------------------------------------------------
 
 def scene_daily(context: SceneContext) -> List[Frame]:
     """The headline card: today's realized P&L, record and session split."""
+    metrics = context.metrics
+    face = metrics.face
     summary = context.summary
     frame = context.blank()
 
@@ -156,30 +179,80 @@ def scene_daily(context: SceneContext) -> List[Frame]:
     text = fmt.money(realized)
 
     if context.compact:
-        size = fmt.fit_scale(text, context.cols - 2, preferred=2)
-        frame.text_centered((context.rows - 5 * size) // 2, text, color, scale=size)
+        size = fmt.fit_scale(text, context.cols - 2, preferred=2, face=face)
+        frame.text_centered(
+            (context.rows - face.height * size) // 2, text, color, scale=size, face=face
+        )
         return hold(frame, context.frames_for(context.config.scene_seconds))
 
     chrome(frame, context, "TODAY")
 
-    size = fmt.fit_scale(text, context.cols - 4, preferred=2)
-    frame.text_centered(BODY_TOP + 1, text, color, scale=size)
+    size = fmt.fit_scale(
+        text, metrics.content_width, preferred=metrics.hero_scale, face=face
+    )
+    hero_y = metrics.body_top
+    frame.text_centered(hero_y, text, color, scale=size, face=face)
 
-    record_y = BODY_TOP + 1 + 5 * size + 3
-    if summary.trades_today:
-        record = f"{summary.wins_today}W {summary.losses_today}L"
-        frame.text(1, record_y, record, WHITE)
-        rate = fmt.percent(summary.win_rate_today, signed=False)
-        frame.text_right(context.cols - 1, record_y, rate, _rate_color(summary.win_rate_today))
-    else:
-        # No closed trades yet is a real state, and it is not "flat".
-        frame.text(1, record_y, "NO CLOSES YET", GREY)
+    record_y = hero_y + face.height * size + 3
+    if metrics.fits(record_y, face.height):
+        if summary.trades_today:
+            record = f"{summary.wins_today}W {summary.losses_today}L"
+            frame.text(metrics.left, record_y, record, WHITE, face=face)
+            rate = fmt.percent(summary.win_rate_today, signed=False)
+            frame.text_right(
+                metrics.right, record_y, rate, _rate_color(summary.win_rate_today), face=face
+            )
+        else:
+            # No closed trades yet is a real state, and it is not "flat".
+            frame.text(
+                metrics.left,
+                record_y,
+                face.fit("NO CLOSES YET", metrics.content_width),
+                GREY,
+                face=face,
+            )
 
-    session_y = record_y + 7
-    if session_y + 5 <= context.rows:
+    session_y = record_y + metrics.line_height
+    if metrics.fits(session_y, face.height):
         _session_split(frame, context, session_y)
 
+    # Taller targets have room for a fourth line. It is only drawn when it
+    # genuinely fits — the panel layout must not depend on it existing.
+    context_y = session_y + metrics.line_height
+    if metrics.fits(context_y, face.height):
+        _standing(frame, context, context_y)
+
     return hold(frame, context.frames_for(context.config.scene_seconds))
+
+
+def _standing(frame: Frame, context: SceneContext, y: int) -> None:
+    """Streak on the left, open exposure on the right.
+
+    Both answer "where do I stand right now" rather than "what happened
+    today", which is what the rest of the card already covers.
+    """
+    metrics = context.metrics
+    face = metrics.face
+    summary = context.summary
+
+    streak = summary.streak
+    streak_color = GREY
+    if streak.length:
+        streak_color = role("good") if streak.winning else role("bad")
+    frame.text(metrics.left, y, streak.label, streak_color, face=face)
+
+    if summary.open_positions:
+        open_text = f"{summary.open_positions} OPEN"
+        if summary.open_unrealized is not None:
+            open_text = f"{summary.open_positions}:{fmt.money(summary.open_unrealized)}"
+            color = pnl_color(summary.open_unrealized)
+        else:
+            color = GREY
+        frame.text_right(
+            metrics.right, y, face.fit(open_text, metrics.content_width - 12), color, face=face
+        )
+    else:
+        frame.text_right(metrics.right, y, "FLAT", GREY, face=face)
 
 
 def _rate_color(rate: Optional[float]) -> RGB:
@@ -194,31 +267,34 @@ def _rate_color(rate: Optional[float]) -> RGB:
 
 def _session_split(frame: Frame, context: SceneContext, y: int) -> None:
     """RTH vs ETH realized — the two behave differently enough to separate."""
+    metrics = context.metrics
+    face = metrics.face
     summary = context.summary
-    frame.text(1, y, "R", GREY)
-    frame.text(5, y, fmt.money(summary.rth_today), pnl_color(summary.rth_today))
+    gap = face.glyph_width("R") + 2
 
-    middle = context.cols // 2 + 2
-    frame.text(middle, y, "E", GREY)
+    frame.text(metrics.left, y, "R", GREY, face=face)
     frame.text(
-        middle + 4, y, fmt.money(summary.eth_today), pnl_color(summary.eth_today)
+        metrics.left + gap, y, fmt.money(summary.rth_today), pnl_color(summary.rth_today), face=face
+    )
+
+    middle = context.cols // 2 + metrics.margin
+    frame.text(middle, y, "E", GREY, face=face)
+    frame.text(
+        middle + gap, y, fmt.money(summary.eth_today), pnl_color(summary.eth_today), face=face
     )
 
 
 # --- positions ----------------------------------------------------------
 
-ROW_PITCH = 8
-ROWS_PER_PAGE = 3
-
-
 def scene_positions(context: SceneContext) -> List[Frame]:
-    """Open risk, biggest first, paged three at a time."""
+    """Open risk, biggest first, paged a few at a time."""
+    metrics = context.metrics
     positions = list(context.snapshot.positions)
     if not positions:
         return _empty_card(context, "OPEN", "NO POSITIONS")
 
-    rows_available = max(1, (context.rows - BODY_TOP) // ROW_PITCH)
-    per_page = min(ROWS_PER_PAGE, rows_available)
+    rows_available = max(1, (context.rows - metrics.body_top) // metrics.row_pitch)
+    per_page = min(POSITION_ROWS, rows_available)
     pages = [positions[i : i + per_page] for i in range(0, len(positions), per_page)]
     seconds_per_page = context.config.scene_seconds / len(pages)
 
@@ -236,39 +312,42 @@ def scene_positions(context: SceneContext) -> List[Frame]:
             right_color=pnl_color(unrealized) if unrealized is not None else None,
         )
         for index, position in enumerate(page):
-            _position_row(frame, context, position, BODY_TOP + index * ROW_PITCH)
+            _position_row(frame, context, position, metrics.body_top + index * metrics.row_pitch)
         frames.extend(hold(frame, context.frames_for(seconds_per_page)))
     return frames
 
 
 def _position_row(frame: Frame, context: SceneContext, position: Position, y: int) -> None:
-    from . import font
+    metrics = context.metrics
+    face = metrics.face
 
     label = fmt.short_symbol(position.symbol, position.underlying)
     change = position.unrealized_pct
     right = fmt.percent(change, digits=0) if change is not None else fmt.MISSING
     color = pnl_color(change) if change is not None else GREY
 
-    right_width = font.text_width(right)
-    frame.text(1, y, font.fit(label, context.cols - right_width - 4), WHITE)
-    frame.text_right(context.cols - 1, y, right, color)
+    right_width = face.text_width(right)
+    frame.text(
+        metrics.left,
+        y,
+        face.fit(label, metrics.content_width - right_width - 2),
+        WHITE,
+        face=face,
+    )
+    frame.text_right(metrics.right, y, right, color, face=face)
 
-    # A proportional bar makes three positions comparable at a glance without
-    # asking anyone to read three numbers.
-    bar_y = y + 6
-    if bar_y < context.rows and change is not None:
-        span = context.cols - 2
+    # A proportional bar makes several positions comparable at a glance without
+    # asking anyone to read several numbers.
+    bar_y = y + face.height + 1
+    if metrics.fits(bar_y, 1) and change is not None:
+        span = metrics.content_width
         filled = int(round(min(1.0, abs(change) / 100.0) * span))
-        frame.hline(1, bar_y, span, UNTRADED)
+        frame.hline(metrics.left, bar_y, span, UNTRADED)
         if filled:
-            frame.hline(1, bar_y, filled, scale_color(color, 0.85))
+            frame.hline(metrics.left, bar_y, filled, scale_color(color, 0.85))
 
 
 # --- calendar -----------------------------------------------------------
-
-CELL = 2
-CELL_PITCH = 3
-
 
 def scene_calendar(context: SceneContext) -> List[Frame]:
     """The journal heat grid: seven rows of weekdays, weeks running across.
@@ -277,6 +356,7 @@ def scene_calendar(context: SceneContext) -> List[Frame]:
     the grid self-scales to the account. Untraded days stay near-black — an
     unlit square means "no trades", never "flat".
     """
+    metrics = context.metrics
     days = list(context.snapshot.days)
     if not days:
         return _empty_card(context, "JRNL", "NO HISTORY")
@@ -291,11 +371,8 @@ def scene_calendar(context: SceneContext) -> List[Frame]:
         right_color=pnl_color(window_pnl),
     )
 
-    top = BODY_TOP + 1
-    # As many weeks as fit across, capped at a quarter — beyond that the
-    # columns are too thin to read and the window is longer than the trader's
-    # working memory anyway.
-    weeks = max(1, min((context.cols - 2) // CELL_PITCH, 16))
+    top = metrics.body_top
+    weeks = max(1, min(metrics.content_width // metrics.cell_pitch, MAX_CALENDAR_WEEKS))
 
     end = context.snapshot.captured_at.date()
     grid = recent_grid(days, end, weeks=weeks)
@@ -303,26 +380,25 @@ def scene_calendar(context: SceneContext) -> List[Frame]:
 
     for column, week in enumerate(grid):
         for row, cell in enumerate(week):
-            x = 1 + column * CELL_PITCH
-            y = top + row * CELL_PITCH
-            if y + CELL > context.rows:
+            x = metrics.left + column * metrics.cell_pitch
+            y = top + row * metrics.cell_pitch
+            if not metrics.fits(y, metrics.cell):
                 continue
             if cell.stats is None or cell.stats.trades == 0:
-                frame.rect(x, y, CELL, CELL, UNTRADED if cell.in_month else BLACK)
+                frame.rect(
+                    x, y, metrics.cell, metrics.cell, UNTRADED if cell.in_month else BLACK
+                )
                 continue
             color = heat_color(heat_level(cell.stats.realized, scale_value))
-            frame.rect(x, y, CELL, CELL, color)
+            frame.rect(x, y, metrics.cell, metrics.cell, color)
             if cell.date == end:
                 # Ring today so the eye finds "now" in the grid immediately.
-                frame.outline(x - 1, y - 1, CELL + 2, CELL + 2, WHITE)
+                frame.outline(x - 1, y - 1, metrics.cell + 2, metrics.cell + 2, WHITE)
 
     return hold(frame, context.frames_for(context.config.scene_seconds))
 
 
 # --- agents -------------------------------------------------------------
-
-AVATAR_PITCH = 9
-
 
 def scene_agents(context: SceneContext) -> List[Frame]:
     """A row of agent avatars, focus stepping through them.
@@ -331,11 +407,15 @@ def scene_agents(context: SceneContext) -> List[Frame]:
     colour is its state, so a red silhouette in the row is visible long before
     anyone reads the label.
     """
+    metrics = context.metrics
+    face = metrics.face
     agents = list(context.snapshot.agents)
     if not agents:
         return _empty_card(context, "AGENTS", "NONE")
 
-    visible = agents[: max(1, (context.cols - 2) // AVATAR_PITCH)]
+    art_scale = 1 if metrics.avatar_pitch < 12 else 2
+    pitch = metrics.avatar_pitch
+    visible = agents[: max(1, metrics.content_width // pitch)]
     seconds_each = context.config.scene_seconds / len(visible)
     frames: List[Frame] = []
 
@@ -343,31 +423,36 @@ def scene_agents(context: SceneContext) -> List[Frame]:
         frame = context.blank()
         chrome(frame, context, "AGENTS")
 
+        avatar_height = 0
         for index, agent in enumerate(visible):
-            x = 1 + index * AVATAR_PITCH
+            x = metrics.left + index * pitch
             sprite = sprites.agent_sprite(agent.agent_id, agent.state)
-            frame.blit(sprite, x, BODY_TOP)
+            frame.blit(sprite, x, metrics.body_top, scale=art_scale)
+            avatar_height = sprite.height * art_scale
             if index == focus_index:
-                marker_y = BODY_TOP + sprite.height + 1
-                if marker_y < context.rows:
-                    frame.hline(x, marker_y, sprite.width, context.plan.accent)
+                marker_y = metrics.body_top + avatar_height + 1
+                if metrics.fits(marker_y, 1):
+                    frame.hline(x, marker_y, sprite.width * art_scale, context.plan.accent)
 
-        label_y = BODY_TOP + 11
-        if label_y + 5 <= context.rows:
-            frame.text(1, label_y, focused.label, WHITE)
+        label_y = metrics.body_top + avatar_height + 3
+        if metrics.fits(label_y, face.height):
+            frame.text(metrics.left, label_y, focused.label, WHITE, face=face)
             state_color = sprites.AGENT_STATE_COLORS.get(focused.state.lower(), GREY)
-            frame.text_right(context.cols - 1, label_y, focused.state.upper()[:4], state_color)
+            frame.text_right(
+                metrics.right, label_y, focused.state.upper()[:4], state_color, face=face
+            )
 
-        message_y = label_y + 7
-        if message_y + 5 <= context.rows and focused.message:
+        message_y = label_y + metrics.line_height
+        if metrics.fits(message_y, face.height) and focused.message:
             steps = context.frames_for(seconds_each)
             for step in range(steps):
                 scrolled = frame.copy()
                 scrolled.text(
-                    1,
+                    metrics.left,
                     message_y,
-                    marquee(focused.message.upper(), context.cols - 2, step),
+                    marquee(focused.message.upper(), metrics.content_width, step, face),
                     GREY,
+                    face=face,
                 )
                 frames.append(scrolled)
             continue
@@ -380,65 +465,84 @@ def scene_agents(context: SceneContext) -> List[Frame]:
 
 def scene_error(context: SceneContext) -> List[Frame]:
     """Draw the broken feeds. This card exists so a dead feed is never silent."""
+    metrics = context.metrics
+    face = metrics.face
     failed = context.snapshot.failed_feeds
     frame = context.blank()
 
     if context.compact:
         frame.rect(0, 0, context.cols, context.rows, (40, 0, 0))
-        frame.text_centered(context.rows // 2 - 3, "FEED", RED)
+        frame.text_centered(context.rows // 2 - 3, "FEED", RED, face=face)
         return hold(frame, context.frames_for(context.config.scene_seconds))
 
     chrome(frame, context, "FEED DOWN", right_text="!", right_color=RED)
-    frame.blit(sprites.WARNING, 2, BODY_TOP + 2)
 
-    left = 2 + sprites.WARNING.width + 3
+    art_scale = 1 if face.height <= 5 else 2
+    frame.blit(sprites.WARNING, metrics.left + 1, metrics.body_top, scale=art_scale)
+
+    left = metrics.left + 1 + sprites.WARNING.width * art_scale + 3
     names = ", ".join(status.name.upper() for status in failed) or "UNKNOWN"
-    frame.text(left, BODY_TOP + 2, names[: max(1, (context.cols - left) // 4)], RED)
+    frame.text(left, metrics.body_top, face.fit(names, context.cols - left - 1), RED, face=face)
 
     detail = failed[0].detail if failed else "no detail"
+    detail_y = context.rows - face.height - 1
     steps = context.frames_for(context.config.scene_seconds)
-    frames: List[Frame] = []
-    for step in range(steps):
-        scrolled = frame.copy()
-        scrolled.text(1, context.rows - 6, marquee(detail.upper(), context.cols - 2, step), GREY)
-        frames.append(scrolled)
-    return frames
+    return [
+        _with_marquee(frame, context, detail.upper(), step, detail_y) for step in range(steps)
+    ]
 
 
 def scene_setup(context: SceneContext) -> List[Frame]:
     """Shown when no broker is configured — the only card with no numbers on it."""
     from ..config import setup_instructions
 
+    metrics = context.metrics
+    face = metrics.face
     frame = context.blank()
+
     if context.compact:
-        frame.text_centered(context.rows // 2 - 3, "SET UP", CYAN)
+        frame.text_centered(context.rows // 2 - 3, "SET UP", CYAN, face=face)
         return hold(frame, context.frames_for(context.config.scene_seconds))
 
     chrome(frame, context, "SETUP", right_text="")
-    frame.blit(sprites.PLUG, 2, BODY_TOP + 2)
-    frame.text(12, BODY_TOP + 2, "NO BROKER", CYAN)
+
+    art_scale = 1 if face.height <= 5 else 2
+    frame.blit(sprites.PLUG, metrics.left + 1, metrics.body_top, scale=art_scale)
+    left = metrics.left + 1 + sprites.PLUG.width * art_scale + 3
+    frame.text(
+        left, metrics.body_top, face.fit("NO BROKER", context.cols - left - 1), CYAN, face=face
+    )
 
     notes = setup_instructions(context.config) or ["set broker credentials"]
     message = " · ".join(notes).upper()
+    detail_y = context.rows - face.height - 1
     steps = context.frames_for(context.config.scene_seconds)
     return [
-        _with_marquee(frame, context, message, step, context.rows - 6) for step in range(steps)
+        _with_marquee(frame, context, message, step, detail_y) for step in range(steps)
     ]
 
 
 def _with_marquee(frame: Frame, context: SceneContext, text: str, step: int, y: int) -> Frame:
+    metrics = context.metrics
     copy = frame.copy()
-    copy.text(1, y, marquee(text, context.cols - 2, step), GREY)
+    copy.text(
+        metrics.left,
+        y,
+        marquee(text, metrics.content_width, step, metrics.face),
+        GREY,
+        face=metrics.face,
+    )
     return copy
 
 
 def _empty_card(context: SceneContext, title: str, message: str) -> List[Frame]:
+    face = context.metrics.face
     frame = context.blank()
     if context.compact:
-        frame.text_centered(context.rows // 2 - 3, title, GREY)
+        frame.text_centered(context.rows // 2 - 3, title, GREY, face=face)
     else:
         chrome(frame, context, title)
-        frame.text_centered(context.rows // 2 - 2, message, GREY)
+        frame.text_centered(context.rows // 2 - face.height // 2, message, GREY, face=face)
     return hold(frame, context.frames_for(context.config.scene_seconds))
 
 
@@ -451,6 +555,8 @@ def scene_event(context: SceneContext, event: DashEvent) -> List[Frame]:
     just another card in the rotation. Sparkles are drawn from ``context.rng``
     so the same win always sparkles the same way.
     """
+    metrics = context.metrics
+    face = metrics.face
     good = event.severity == "good"
     accent = role(event.severity, WHITE)
 
@@ -465,36 +571,36 @@ def scene_event(context: SceneContext, event: DashEvent) -> List[Frame]:
         flash.rect(0, 0, context.cols, context.rows, scale_color(accent, level))
         frames.append(flash)
 
-    from . import font
-
     body = context.blank()
 
     # The headline gets as many rows as it needs. "MISSION FAILED" does not fit
     # one 52-pixel row, and squeezing the letter spacing to force it makes the
     # word unreadable at exactly the moment it matters most.
-    headline = font.wrap(event.title, context.cols - 2, lines=2)
+    headline = face.wrap(event.title, metrics.content_width, lines=2)
     for index, line in enumerate(headline):
-        body.text_centered(index * 6, line, accent)
+        body.text_centered(index * metrics.line_height, line, accent, face=face)
 
-    body_top = len(headline) * 6 + 1
+    body_top = len(headline) * metrics.line_height + 1
     sprite = sprites.outcome_sprite(good) if event.kind in (EventKind.WIN, EventKind.LOSS) else None
     if sprite is None and event.kind in (EventKind.FEED_DOWN, EventKind.FEED_RECOVERED):
         sprite = sprites.PLUG if event.kind is EventKind.FEED_RECOVERED else sprites.WARNING
 
-    text_left = 2
+    text_left = metrics.left + 1
     if sprite is not None:
-        art_scale = 2 if body_top + sprite.height * 2 <= context.rows else 1
-        body.blit(sprite, 2, body_top, scale=art_scale)
-        text_left = 2 + sprite.width * art_scale + 3
+        art_scale = max(1, (context.rows - body_top) // sprite.height)
+        art_scale = min(art_scale, 4)
+        body.blit(sprite, metrics.left + 1, body_top, scale=art_scale)
+        text_left = metrics.left + 1 + sprite.width * art_scale + 3
 
     if event.amount is not None:
-        body.text(text_left, body_top + 2, fmt.money(event.amount), accent)
+        body.text(text_left, body_top + 2, fmt.money(event.amount), accent, face=face)
     if event.detail:
         body.text(
             text_left,
-            body_top + 10,
-            font.fit(event.detail, context.cols - text_left - 1),
+            body_top + 2 + metrics.line_height,
+            face.fit(event.detail, context.cols - text_left - 1),
             WHITE,
+            face=face,
         )
 
     reveal_steps = context.frames_for(0.4)
@@ -504,8 +610,8 @@ def scene_event(context: SceneContext, event: DashEvent) -> List[Frame]:
         frames.append(stage)
 
     settle_steps = context.frames_for(1.6)
-    sparkle_count = 10 if good else 0
-    for step in range(settle_steps):
+    sparkle_count = max(6, context.cols // 5) if good else 0
+    for _step in range(settle_steps):
         stage = body.copy()
         for _ in range(sparkle_count):
             x = context.rng.randrange(context.cols)
@@ -522,15 +628,18 @@ def scene_event(context: SceneContext, event: DashEvent) -> List[Frame]:
 
 
 def _compact_event(context: SceneContext, event: DashEvent, accent: RGB) -> List[Frame]:
+    face = context.metrics.face
     frames: List[Frame] = []
     for level in (0.7, 0.35):
         flash = context.blank()
         flash.rect(0, 0, context.cols, context.rows, scale_color(accent, level))
         frames.append(flash)
     body = context.blank()
-    body.text_centered(context.rows // 2 - 6, "WIN" if event.severity == "good" else "LOSS", accent)
+    body.text_centered(
+        context.rows // 2 - 6, "WIN" if event.severity == "good" else "LOSS", accent, face=face
+    )
     if event.amount is not None:
-        body.text_centered(context.rows // 2 + 1, fmt.money(event.amount), accent)
+        body.text_centered(context.rows // 2 + 1, fmt.money(event.amount), accent, face=face)
     frames.extend(hold(body, context.frames_for(1.5)))
     return frames
 

@@ -42,6 +42,17 @@ class Sink(abc.ABC):
 
     name: str = "sink"
 
+    #: Geometry this sink wants, as a key into
+    #: :data:`~lumisync.pixeldash.models.KNOWN_TARGETS`. ``""`` means "whatever
+    #: the config's panel target is".
+    #:
+    #: A monitor is not a panel: an LED matrix has a fixed pixel count, but a
+    #: hover overlay can draw as many pixels as it likes, and a denser grid is
+    #: what buys the larger, more legible font. So the screen sinks ask for
+    #: ``screen`` while the panel sink stays at hardware resolution, and the
+    #: service renders once per distinct geometry.
+    target: str = ""
+
     @abc.abstractmethod
     def publish(self, result: RenderResult) -> SinkReport:
         """Send a render onward. Must not raise — return a failing report."""
@@ -69,6 +80,18 @@ def publish_all(sinks: Sequence[Sink], result: RenderResult) -> List[SinkReport]
         except Exception as exc:
             reports.append(SinkReport.failure(sink.name, f"{type(exc).__name__}: {exc}"))
     return reports
+
+
+def group_by_target(sinks: Sequence[Sink], default: str) -> Dict[str, List[Sink]]:
+    """Bucket sinks by the geometry they want, so each is rendered once.
+
+    Two sinks asking for the same geometry share a single render; a sink with
+    no preference joins the default bucket.
+    """
+    groups: Dict[str, List[Sink]] = {}
+    for sink in sinks:
+        groups.setdefault(getattr(sink, "target", "") or default, []).append(sink)
+    return groups
 
 
 def close_all(sinks: Sequence[Sink]) -> None:

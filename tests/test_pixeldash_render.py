@@ -10,7 +10,7 @@ import unittest
 from lumisync.pixeldash import format as fmt
 from lumisync.pixeldash.events import DashEvent, EventKind
 from lumisync.pixeldash.models import KNOWN_TARGETS, FeedStatus
-from lumisync.pixeldash.render import font, planner, scenes
+from lumisync.pixeldash.render import font, metrics, planner, scenes
 from lumisync.pixeldash.render.canvas import Frame, Sprite
 from lumisync.pixeldash.render.gif import decode_frames, encode, unique_colors
 from lumisync.pixeldash.render.palette import GREEN, RED, heat_color, pnl_color
@@ -21,17 +21,42 @@ from pixeldash_fixtures import MOMENT, busy_snapshot, config, snapshot, trade
 
 class FontTests(unittest.TestCase):
     def test_every_glyph_row_is_rectangular(self):
-        for char, rows in font._RAW.items():
-            widths = {len(row) for row in rows}
-            self.assertEqual(len(widths), 1, f"{char!r} has ragged rows")
-            self.assertEqual(len(rows), font.GLYPH_HEIGHT, f"{char!r} is the wrong height")
+        # build_font raises on ragged glyphs, so both faces existing at import
+        # time already proves this; the assertion documents the invariant.
+        for face in font.FONTS:
+            for char, offsets in face.glyphs.items():
+                width = face.glyph_width(char)
+                for x, y in offsets:
+                    self.assertLess(x, width, f"{face.name} {char!r} overflows its width")
+                    self.assertLess(y, face.height, f"{face.name} {char!r} overflows its height")
+
+    def test_a_ragged_glyph_is_refused_at_build_time(self):
+        with self.assertRaises(ValueError):
+            font.build_font("bad", {"A": ("##", "#"), "?": ("#", "#")})
+
+    def test_glyphs_disagreeing_on_height_are_refused(self):
+        with self.assertRaises(ValueError):
+            font.build_font("bad", {"A": ("#", "#"), "?": ("#", "#", "#")})
+
+    def test_both_faces_cover_the_same_characters(self):
+        # A string that renders on the panel must render on the screen too.
+        self.assertEqual(set(font.SMALL.glyphs), set(font.LARGE.glyphs))
 
     def test_m_n_and_w_are_distinct_shapes(self):
-        # The whole reason the font is variable-width. If these ever collapse
-        # back into each other, OPEN reads as OPEM on the panel.
-        self.assertNotEqual(font.GLYPHS["M"], font.GLYPHS["N"])
-        self.assertNotEqual(font.GLYPHS["W"], font.GLYPHS["M"])
-        self.assertNotEqual(font.GLYPHS["N"], font.GLYPHS["H"])
+        # The whole reason the small font is variable-width. If these ever
+        # collapse back into each other, OPEN reads as OPEM on the panel.
+        for face in font.FONTS:
+            self.assertNotEqual(face.glyphs["M"], face.glyphs["N"], face.name)
+            self.assertNotEqual(face.glyphs["W"], face.glyphs["M"], face.name)
+            self.assertNotEqual(face.glyphs["N"], face.glyphs["H"], face.name)
+
+    def test_the_large_face_is_taller_and_wider(self):
+        self.assertGreater(font.LARGE.height, font.SMALL.height)
+        self.assertGreater(font.LARGE.text_width("SPY"), font.SMALL.text_width("SPY"))
+
+    def test_module_level_helpers_use_the_panel_face(self):
+        self.assertEqual(font.text_width("SPY"), font.SMALL.text_width("SPY"))
+        self.assertEqual(font.text_height(), font.SMALL.height)
 
     def test_text_width_accounts_for_wide_glyphs(self):
         self.assertGreater(font.text_width("NN"), font.text_width("II"))
@@ -354,3 +379,123 @@ class GifTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MetricsTests(unittest.TestCase):
+    """Layout has to come from the target, not from constants in the composer."""
+
+    def test_the_panel_keeps_the_small_face(self):
+        chosen = metrics.metrics_for(KNOWN_TARGETS["H6631"])
+        self.assertIs(chosen.face, font.SMALL)
+
+    def test_screen_targets_earn_the_large_face(self):
+        for name in ("screen", "screen-xl"):
+            self.assertIs(metrics.metrics_for(KNOWN_TARGETS[name]).face, font.LARGE)
+
+    def test_tiny_panels_never_get_the_large_face(self):
+        for name in ("16x16", "16x32", "32x32", "64x32"):
+            self.assertIs(metrics.metrics_for(KNOWN_TARGETS[name]).face, font.SMALL)
+
+    # The hero measurements only govern the full layout. Compact targets take
+    # scene_daily's stripped-down branch, which sizes per value against the raw
+    # panel width — a 16x16 grid cannot fit "-99.9K" at any scale, and pretending
+    # the metric could satisfy that would be a lie about the hardware.
+    def test_the_hero_number_leaves_room_for_the_record_line(self):
+        for target in KNOWN_TARGETS.values():
+            chosen = metrics.metrics_for(target)
+            if chosen.compact:
+                continue
+            needed = (
+                chosen.body_top
+                + chosen.face.height * chosen.hero_scale
+                + 3
+                + chosen.face.height
+            )
+            self.assertLessEqual(needed, target.rows, target.name)
+
+    def test_the_hero_specimen_fits_the_width(self):
+        for target in KNOWN_TARGETS.values():
+            chosen = metrics.metrics_for(target)
+            if chosen.compact:
+                continue
+            width = chosen.face.text_width(metrics.HERO_SPECIMEN, chosen.hero_scale)
+            self.assertLessEqual(width, chosen.content_width + chosen.margin, target.name)
+
+    def test_compact_targets_still_render_a_readable_number(self):
+        # The compact branch truncates rather than overflowing, which is the
+        # only honest option at 16 pixels wide.
+        for name in ("16x16", "16x32"):
+            chosen = metrics.metrics_for(KNOWN_TARGETS[name])
+            self.assertTrue(chosen.compact)
+            self.assertEqual(chosen.hero_scale, 1)
+
+    def test_position_rows_fit_the_body(self):
+        for target in KNOWN_TARGETS.values():
+            chosen = metrics.metrics_for(target)
+            if chosen.compact:
+                continue
+            rows = (target.rows - chosen.body_top) // chosen.row_pitch
+            self.assertGreaterEqual(rows, 1, target.name)
+
+    def test_a_denser_target_gets_bigger_measurements(self):
+        panel = metrics.metrics_for(KNOWN_TARGETS["H6631"])
+        screen = metrics.metrics_for(KNOWN_TARGETS["screen"])
+        self.assertGreater(screen.row_pitch, panel.row_pitch)
+        self.assertGreater(screen.cell_pitch, panel.cell_pitch)
+        self.assertGreater(screen.line_height, panel.line_height)
+
+    def test_content_area_stays_inside_the_target(self):
+        for target in KNOWN_TARGETS.values():
+            chosen = metrics.metrics_for(target)
+            self.assertGreater(chosen.content_width, 0, target.name)
+            self.assertLessEqual(chosen.right, target.cols, target.name)
+
+
+class MultiTargetRenderTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.config = config(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_a_target_override_changes_the_frame_size(self):
+        result = render(busy_snapshot(), self.config, target=KNOWN_TARGETS["screen"])
+        self.assertEqual(result.frames[0].cols, 104)
+        self.assertEqual(result.frames[0].rows, 64)
+        self.assertEqual(result.target.name, "screen")
+
+    def test_the_target_is_folded_into_the_digest(self):
+        panel = render(busy_snapshot(), self.config)
+        screen = render(busy_snapshot(), self.config, target=KNOWN_TARGETS["screen"])
+        self.assertNotEqual(panel.digest, screen.digest)
+
+    def test_each_target_is_still_individually_deterministic(self):
+        first = render(busy_snapshot(), self.config, target=KNOWN_TARGETS["screen"])
+        second = render(busy_snapshot(), self.config, target=KNOWN_TARGETS["screen"])
+        self.assertEqual(first.gif_bytes(), second.gif_bytes())
+
+    def test_the_manifest_records_the_geometry(self):
+        manifest = render(
+            busy_snapshot(), self.config, target=KNOWN_TARGETS["screen"]
+        ).manifest()
+        self.assertEqual(manifest["target"], "screen")
+        self.assertEqual(manifest["size"], [104, 64])
+
+    def test_every_scene_renders_on_the_screen_targets(self):
+        import random
+
+        for name in ("screen", "screen-xl"):
+            target = KNOWN_TARGETS[name]
+            snap = busy_snapshot()
+            context = scenes.build_context(
+                snap,
+                self.config,
+                planner.rule_plan(snap, self.config),
+                random.Random(1),
+                target=target,
+            )
+            for scene_id in scenes.available_scenes():
+                frames = scenes.compose(context, scene_id)
+                self.assertTrue(frames, f"{scene_id} on {name}")
+                self.assertEqual(frames[0].cols, target.cols)

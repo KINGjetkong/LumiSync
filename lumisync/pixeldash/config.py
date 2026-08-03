@@ -13,7 +13,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from .models import DataClass, RenderTarget, KNOWN_TARGETS
+from .models import DEFAULT_SCREEN_TARGET, DataClass, RenderTarget, KNOWN_TARGETS
 
 #: Environment variables read for each broker. Documented here so the settings
 #: UI and the CLI can print exactly what the user needs to set.
@@ -81,6 +81,14 @@ class PixelDashConfig:
     hover_enabled: bool = True
     hover_scale: int = 6
     hover_opacity: float = 0.9
+    #: Geometry the on-screen sinks render at. Denser than the panel so the
+    #: layout earns the larger font; set to "" to make them match the panel.
+    screen_target: str = DEFAULT_SCREEN_TARGET
+
+    #: Directory of declarative API specs. Drop a JSON file in here and the
+    #: feed appears alongside the built-in brokers; see
+    #: :mod:`lumisync.pixeldash.feeds.specs`.
+    feeds_dir: str = ""
 
     # --- planner ---
     #: Cache directory for AI-authored scene plans. Plans are keyed by a digest
@@ -234,6 +242,10 @@ def load_config(
         config.output_dir = default_output_dir()
     if not config.plan_cache_dir:
         config.plan_cache_dir = os.path.join(config.output_dir, "plans")
+    if not config.feeds_dir:
+        from .feeds.specs import ensure_feeds_dir
+
+        config.feeds_dir = ensure_feeds_dir(config.output_dir)
     return config
 
 

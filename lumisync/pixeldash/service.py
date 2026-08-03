@@ -14,7 +14,7 @@ from __future__ import annotations
 import datetime as _dt
 import threading
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from .collector import collect, now_market
 from .config import PixelDashConfig
@@ -22,20 +22,28 @@ from .events import DashEvent, EventLog, diff
 from .feeds.base import TradeFeed
 from .feeds.registry import build_feeds
 from .journal import Journal, default_journal_path
-from .models import DashboardSnapshot, FeedStatus
+from .models import KNOWN_TARGETS, DashboardSnapshot, FeedStatus
+from .render import planner
 from .render.pipeline import RenderResult, render
 from .render.planner import PlannerHook
-from .sinks.base import Sink, SinkReport, close_all, publish_all
+from .sinks.base import Sink, SinkReport, close_all, group_by_target, publish_all
 
 
 @dataclass
 class ServiceTick:
-    """The result of one refresh."""
+    """The result of one refresh.
+
+    ``result`` is the panel-geometry render — what the preview and the panel
+    sink use. ``renders`` holds every geometry produced this tick, keyed by
+    target name, because the screen surfaces render on a denser grid than the
+    panel and both are real outputs of the same snapshot.
+    """
 
     snapshot: DashboardSnapshot
     result: Optional[RenderResult] = None
     events: Tuple[DashEvent, ...] = ()
     reports: List[SinkReport] = field(default_factory=list)
+    renders: Dict[str, RenderResult] = field(default_factory=dict)
     error: str = ""
 
     @property
@@ -147,12 +155,7 @@ class PixelDashService:
         self.previous = snapshot
 
         try:
-            result = render(
-                snapshot,
-                self.config,
-                events=fresh,
-                hook=self.planner_hook,
-            )
+            renders = self.render_all(snapshot, fresh)
         except Exception as exc:
             tick = ServiceTick(
                 snapshot=snapshot,
@@ -162,12 +165,51 @@ class PixelDashService:
             self.last_tick = tick
             return tick
 
-        reports = publish_all(self.sinks, result) if publish and self.sinks else []
+        reports: List[SinkReport] = []
+        if publish and self.sinks:
+            for target_name, sinks in group_by_target(self.sinks, self.config.target.name).items():
+                result = renders.get(target_name)
+                if result is not None:
+                    reports.extend(publish_all(sinks, result))
+
         tick = ServiceTick(
-            snapshot=snapshot, result=result, events=tuple(fresh), reports=reports
+            snapshot=snapshot,
+            result=renders.get(self.config.target.name),
+            events=tuple(fresh),
+            reports=reports,
+            renders=renders,
         )
         self.last_tick = tick
         return tick
+
+    def render_all(
+        self, snapshot: DashboardSnapshot, events: Sequence[DashEvent]
+    ) -> Dict[str, RenderResult]:
+        """Render this snapshot once per geometry any sink asked for.
+
+        The panel geometry is always produced, even with no sinks attached, so
+        the GUI preview and ``--once`` always have something to show. The plan
+        is resolved once and shared: it is a property of the situation, not of
+        the geometry, and re-resolving it per target would consult the planner
+        cache several times for the same answer.
+        """
+        wanted = {self.config.target.name}
+        for sink in self.sinks:
+            wanted.add(getattr(sink, "target", "") or self.config.target.name)
+
+        shared_plan = planner.plan(snapshot, self.config, hook=self.planner_hook)
+
+        renders: Dict[str, RenderResult] = {}
+        for name in sorted(wanted):
+            target = KNOWN_TARGETS.get(name, self.config.target)
+            renders[name] = render(
+                snapshot,
+                self.config,
+                events=events,
+                plan=shared_plan,
+                target=target,
+            )
+        return renders
 
     # --- loop ---
     def run_forever(

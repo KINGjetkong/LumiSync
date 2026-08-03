@@ -79,10 +79,20 @@ def command_check(config: PixelDashConfig) -> int:
     """Report what is configured and whether each feed answers."""
     from .feeds.registry import build_feeds
 
+    from .feeds.specs import describe, load_specs
+
     print(f"target      : {config.target.name} ({config.target.cols}x{config.target.rows})")
+    print(f"screen      : {config.screen_target or config.target.name}")
     print(f"output      : {config.output_dir}")
     print(f"refresh     : {config.refresh_seconds:g}s · scenes {config.scene_seconds:g}s")
     print(f"planner     : {'on' if config.planner_enabled else 'off'} -> {config.plan_cache_dir}")
+    print(f"feeds.d     : {config.feeds_dir}")
+
+    specs, spec_errors = load_specs(config.feeds_dir)
+    for spec in specs:
+        print(f"spec {spec.name:<10}: {describe(spec)}")
+    for path, message in spec_errors:
+        print(f"spec {'BAD':<10}: {path} — {message}")
 
     feeds, statuses = build_feeds(config)
     for status in statuses:
