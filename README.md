@@ -30,6 +30,7 @@ Visit the website: [lumisync.minlor.net](https://lumisync.minlor.net)
 | 🖥️ **Monitor Sync** | Sample colors from screen regions and sync to your LED strip in real-time |
 | 🎵 **Music Sync** | React to audio with dynamic color patterns |
 | 🎨 **Color Control** | Set custom colors and brightness directly from the app |
+| 📊 **Pixel Dash** | Live broker stats rendered as a deterministic pixel-art GIF, routed to a panel, a ghost display or a hover overlay — [docs](docs/pixeldash.md) |
 | 🖌️ **Modern GUI** | Blue-accented PySide6 interface with selectable Acrylic, Mica, and Solid Dark window materials |
 | 🔌 **Multi-Vendor** | Govee (LAN), iDotMatrix pixel panels (Bluetooth), and LSC/Tuya WiFi lights |
 | 🔍 **Auto-Discovery** | Automatically finds Govee devices on your LAN via UDP broadcast |
@@ -135,6 +136,7 @@ with `lumisync --cli`; direct headless modes are available through
 - **Monitor Sync** — Map display colors to selected devices, groups, zones, and custom LED regions.
 - **Music Sync** — Choose reactions, palettes, targets and brightness, or use Auto Director.
 - **Draw** — Paint still images or frame-by-frame animations for compatible iDotMatrix panels.
+- **Pixel Dash** — Poll your broker, render trade stats as pixel art, and route it to a panel, a ghost virtual display or a hover overlay. Real broker data only; a missing feed renders an error card, never a plausible-looking zero.
 - **Settings** — Choose Acrylic, Mica, or Solid Dark; select a display, tune sync behavior, manage groups, startup and system-tray options.
 
 ### Configuration
@@ -155,6 +157,10 @@ lumisync/
 ├── devices.py           # Device discovery & caching
 ├── config/options.py    # Runtime configuration
 ├── sync/                # Monitor & music sync engines
+├── pixeldash/           # Trading dashboard -> pixel art -> GIF -> sinks
+│   ├── feeds/           # Tradier / Alpaca, fail-closed
+│   ├── render/          # Pixel font, scenes, deterministic GIF pipeline
+│   └── sinks/           # Panel, ghost display, hover overlay, files
 ├── gui/                 # PySide6 application
 │   ├── controllers/     # Business logic (QObject + pyqtSignal)
 │   ├── views/           # UI components
