@@ -45,6 +45,7 @@ the packaged Windows build) bundles all transports, no extras to remember.
 |--------|-----------|-------|
 | Govee strips/bulbs | LAN (UDP) | Enable "LAN Control" in the Govee app |
 | iDotMatrix panels | Bluetooth LE | Pixel displays; see [docs](docs/idotmatrix-ble-research.md) |
+| Govee pixel panels | LAN (UDP) | 52×32 H6631; per-pixel path in progress — see [docs](docs/govee-pixel-panel-research.md) |
 | LSC / Tuya WiFi lights | LAN (Tuya local) | Needs the device's local key — see [docs](docs/lsc-tuya-research.md) |
 
 ## 📸 Screenshots

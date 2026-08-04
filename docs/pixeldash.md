@@ -379,11 +379,20 @@ opt-in process that consumes the manifest:
 Pixel Dash  ->  dashboard.json  ->  govee_scene_bridge  ->  Govee cloud API
 ```
 
-### If a per-pixel transport turns up
+### Going after the per-pixel path directly
 
-Adding it is a LumiSync driver implementing `draw_grid()`. `probe()` picks it up
-and the panel sink switches from `AMBIENT` to `PIXEL` with no changes to Pixel
-Dash — that is what the capability probe is for.
+The vendor's ceiling is not the hardware's ceiling. The app drives all 1,664
+LEDs over the LAN, so the capability is on the wire and undocumented rather than
+absent.
+
+`lumisync/drivers/govee_pixel.py` is a real per-pixel driver written against
+four candidate encodings, and `tools/govee_pixel_probe.py` captures what the
+Govee app actually sends so the right one can be identified against your panel.
+Full procedure: **[docs/govee-pixel-panel-research.md](govee-pixel-panel-research.md)**.
+
+Until a capture confirms an encoding the driver reports itself `UNVERIFIED` and
+nothing here claims the panel is showing a live dashboard. Once it is confirmed,
+`probe()` already resolves that driver to `PIXEL` mode — no other change needed.
 
 ---
 
