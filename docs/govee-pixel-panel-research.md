@@ -73,7 +73,21 @@ fragments" — so treat a `single` failure as weak evidence and rely on the othe
 
 ## The procedure
 
+**Just want to run it?** [govee-quickstart.md](govee-quickstart.md) is five
+steps and one command. Everything below is the same thing with the reasoning
+attached.
+
 Run these where the hardware is, on your own network.
+
+### 0. Or skip all of it
+
+```bash
+python tools/govee_pixel_probe.py wizard
+```
+
+Runs every step below in order, asks plain yes/no questions, and prints the one
+line worth sending back. The steps that follow are what it does, for when a run
+goes sideways and you need to drive it by hand.
 
 ### 1. Confirm the panel answers
 

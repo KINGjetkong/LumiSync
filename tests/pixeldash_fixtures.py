@@ -73,6 +73,29 @@ def trade(
     )
 
 
+def trade_today(realized: float, *, hour: int = 11, symbol: str = "SPY260803C00550000") -> Trade:
+    """A trade closed on the real current date.
+
+    Most fixtures hang off the fixed :data:`MOMENT` so renders stay
+    reproducible. Anything that goes through the live service is different: the
+    collector stamps snapshots with the real clock, so a trade pinned to a fixed
+    date stops being "today" the moment the calendar moves past it — which is
+    exactly how this suite broke once already.
+    """
+    closed = _dt.datetime.now(tz=market_tz()).replace(
+        hour=hour, minute=15, second=0, microsecond=0
+    )
+    return Trade(
+        symbol=symbol,
+        closed_at=closed,
+        realized=realized,
+        data_class=DataClass.LIVE,
+        quantity=5,
+        opened_at=closed - _dt.timedelta(minutes=20),
+        underlying=symbol[:3],
+    )
+
+
 def snapshot(
     *,
     positions: Sequence[Position] = (),

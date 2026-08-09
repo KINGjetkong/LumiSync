@@ -389,12 +389,263 @@ def _test_pattern(cols: int, rows: int) -> List[List[Tuple[int, int, int]]]:
     return grid
 
 
+# --- wizard -------------------------------------------------------------
+#
+# One command, plain questions, no protocol knowledge required. The experiment
+# is deliberately two rounds: flood a distinct colour per strategy first,
+# because "which colour did it turn" is a question anyone can answer from
+# across the room and it settles *whether* an encoding reaches the panel at
+# all. Only then does it test addressing, and only for encodings that worked.
+
+WIZARD_COLORS: List[Tuple[str, Tuple[int, int, int]]] = [
+    ("RED", (255, 0, 0)),
+    ("GREEN", (0, 255, 0)),
+    ("BLUE", (0, 0, 255)),
+    ("YELLOW", (255, 200, 0)),
+]
+
+
+def _ask(question: str, default: bool = False) -> bool:
+    suffix = "[Y/n]" if default else "[y/N]"
+    try:
+        answer = input(f"{question} {suffix} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+    if not answer:
+        return default
+    return answer.startswith("y")
+
+
+def _pause(message: str = "Press Enter when ready… ") -> None:
+    try:
+        input(message)
+    except (EOFError, KeyboardInterrupt):
+        print()
+
+
+def command_wizard(args: argparse.Namespace) -> int:
+    """Walk the whole experiment start to finish, asking plain questions."""
+    print("=" * 62)
+    print("  GOVEE PIXEL PANEL — FINDING THE PER-PIXEL PATH")
+    print("=" * 62)
+    print(
+        "\nThis runs a few light patterns on your panel and asks what you saw."
+        "\nNo technical knowledge needed. Takes about two minutes.\n"
+    )
+
+    # --- step 1: find the panel ---
+    ip = args.ip
+    if not ip:
+        print("STEP 1 — Finding your panel on the network…\n")
+        ip = _wizard_find_panel(args.timeout)
+        if not ip:
+            return 1
+    else:
+        print(f"STEP 1 — Using the panel you gave me: {ip}\n")
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    address = (ip, CONTROL_PORT)
+
+    def send(message: Dict[str, Any]) -> None:
+        sock.sendto(json.dumps(message).encode(), address)
+
+    try:
+        # --- step 2: prove we can talk to it at all ---
+        print("\nSTEP 2 — Checking I can control the panel.")
+        print("Watch it now — it should turn on and go bright.\n")
+        send({"msg": {"cmd": "turn", "data": {"value": 1}}})
+        time.sleep(0.5)
+        send({"msg": {"cmd": "brightness", "data": {"value": 100}}})
+        time.sleep(1.5)
+
+        if not _ask("Did the panel turn on / get brighter?", default=True):
+            print("\nSo basic control is not getting through. Fix that first:")
+            print("  Govee Home app -> your panel -> settings -> turn ON 'LAN Control'")
+            print("  Also check this computer is on the same Wi-Fi as the panel.")
+            print("\nThen run this again.")
+            return 1
+        print("\n  Good — basic control works. Now the real test.\n")
+
+        # --- step 3: which encoding reaches the panel ---
+        print("-" * 62)
+        print("STEP 3 — I'll try 4 different ways to send a picture.")
+        print("Each one floods the WHOLE panel with a different colour.")
+        print("Just note which colours actually show up.\n")
+        for index, (label, _rgb) in enumerate(WIZARD_COLORS, start=1):
+            print(f"   Try {index}: {label}")
+        print("\nSome may do nothing at all. That is expected and useful.")
+        _pause()
+
+        send(control_message(build_mode_frame(True)))
+        time.sleep(0.4)
+
+        names = list(STRATEGIES)
+        for index, name in enumerate(names):
+            label, rgb = WIZARD_COLORS[index % len(WIZARD_COLORS)]
+            grid = [[rgb] * args.cols for _ in range(args.rows)]
+            frames = encode_grid(grid, name)
+
+            print(f"\n  Sending {label}…  ({len(frames)} packet(s))")
+            for packet_index, frame in enumerate(frames):
+                send(control_message(frame))
+                if packet_index + 1 < len(frames):
+                    time.sleep(args.pace / 1000.0)
+            time.sleep(args.hold)
+
+        send(control_message(build_mode_frame(False)))
+
+        print("\n" + "-" * 62)
+        print("Which colours did you actually see on the panel?\n")
+        working: List[str] = []
+        for index, name in enumerate(names):
+            label, _rgb = WIZARD_COLORS[index % len(WIZARD_COLORS)]
+            if _ask(f"  Did you see {label}?"):
+                working.append(name)
+
+        if not working:
+            return _wizard_no_luck(ip)
+
+        # --- step 4: orientation, only for what worked ---
+        print("\n" + "-" * 62)
+        print(f"STEP 4 — {len(working)} way(s) worked. Now checking the picture is")
+        print("the right way round.\n")
+        print("I'll draw a pattern with 4 different corners:")
+        print("   top-left RED · top-right GREEN")
+        print("   bottom-left BLUE · bottom-right WHITE")
+        print("   plus an ORANGE dot dead centre.\n")
+        _pause()
+
+        send(control_message(build_mode_frame(True)))
+        time.sleep(0.4)
+
+        correct: List[str] = []
+        for name in working:
+            frames = encode_grid(_test_pattern(args.cols, args.rows), name)
+            print(f"\n  Drawing with method '{name}'…")
+            for packet_index, frame in enumerate(frames):
+                send(control_message(frame))
+                if packet_index + 1 < len(frames):
+                    time.sleep(args.pace / 1000.0)
+            time.sleep(args.hold + 1.0)
+
+            if _ask("  Corners in the right places (red top-left)?"):
+                correct.append(name)
+
+        send(control_message(build_mode_frame(False)))
+        return _wizard_report(working, correct)
+    finally:
+        sock.close()
+
+
+def _wizard_find_panel(timeout: float) -> str:
+    """Discover the panel, or explain in plain words why nothing answered."""
+    listener = _bind(LISTEN_PORT, timeout)
+    sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+
+    found: Dict[str, Dict[str, Any]] = {}
+    try:
+        sender.sendto(json.dumps(SCAN_REQUEST).encode(), (MULTICAST_ADDR, MULTICAST_PORT))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                payload, origin = listener.recvfrom(4096)
+            except socket.timeout:
+                break
+            try:
+                message = json.loads(payload.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                continue
+            data = (message.get("msg") or {}).get("data") or {}
+            found[str(data.get("ip") or origin[0])] = data
+    finally:
+        listener.close()
+        sender.close()
+
+    if not found:
+        print("  I could not find any Govee device on this network.\n")
+        print("  Almost always one of these two things:\n")
+        print("   1. LAN Control is off.")
+        print("      Govee Home app -> your panel -> settings -> turn ON 'LAN Control'")
+        print("   2. This computer is on a different Wi-Fi than the panel.")
+        print("      (Guest networks and 5GHz-vs-2.4GHz splits both cause this.)\n")
+        print("  Fix that, then run this again.")
+        return ""
+
+    if len(found) == 1:
+        ip = next(iter(found))
+        print(f"  Found it: {found[ip].get('sku', 'device')} at {ip}")
+        return ip
+
+    print(f"  Found {len(found)} devices:\n")
+    options = sorted(found)
+    for index, candidate in enumerate(options, start=1):
+        print(f"   {index}. {found[candidate].get('sku', '?'):<8} {candidate}")
+    try:
+        choice = input("\n  Which number is the pixel panel? ").strip()
+        return options[int(choice) - 1]
+    except (ValueError, IndexError, EOFError, KeyboardInterrupt):
+        print("  Not a valid choice.")
+        return ""
+
+
+def _wizard_no_luck(ip: str) -> int:
+    print("\n" + "=" * 62)
+    print("  NONE OF THEM WORKED — and that is still useful.")
+    print("=" * 62)
+    print(
+        "\nThe panel takes basic commands but ignores all four picture formats,"
+        "\nso it uses something different. One more capture finds it.\n"
+    )
+    print("Do this:\n")
+    print("  1. Open a terminal and run:")
+    print("       python tools/govee_pixel_probe.py watch --save capture.jsonl\n")
+    print("  2. Leave it running. On your phone, open Govee Home and")
+    print("     show ANY picture on the panel (a DIY scene works).\n")
+    print("  3. Press Ctrl-C in the terminal.\n")
+    print("  4. Send me capture.jsonl.\n")
+    print(f"(Panel address, in case you need it: {ip})")
+    return 2
+
+
+def _wizard_report(working: List[str], correct: List[str]) -> int:
+    print("\n" + "=" * 62)
+    print("  DONE — here is what to send me")
+    print("=" * 62 + "\n")
+
+    if correct:
+        print(f"  WORKING METHOD: {correct[0]}")
+        if len(correct) > 1:
+            print(f"  (also worked: {', '.join(correct[1:])})")
+        print("\n  Copy that line and send it to me. That is all I need —")
+        print("  the panel will stream your live dashboard after that.")
+        return 0
+
+    print(f"  Showed colour: {', '.join(working)}")
+    print("  But the picture came out wrong / scrambled.\n")
+    print("  Send me the line above. Scrambled is close — it means the data")
+    print("  is landing and only the pixel order is off, which is a small fix.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="govee_pixel_probe",
         description="Find the undocumented per-pixel path to a Govee pixel panel.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    wizard = sub.add_parser(
+        "wizard", help="START HERE — does everything and asks you simple questions"
+    )
+    wizard.add_argument("--ip", default="", help="skip discovery and use this address")
+    wizard.add_argument("--cols", type=int, default=52)
+    wizard.add_argument("--rows", type=int, default=32)
+    wizard.add_argument("--timeout", type=float, default=4.0)
+    wizard.add_argument("--pace", type=float, default=2.0, help="ms between packets")
+    wizard.add_argument("--hold", type=float, default=3.0, help="seconds to show each attempt")
+    wizard.set_defaults(func=command_wizard)
 
     scan = sub.add_parser("scan", help="discover Govee devices on the LAN")
     scan.add_argument("--timeout", type=float, default=3.0)

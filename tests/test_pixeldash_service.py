@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as _dt
 import tempfile
 import threading
 import unittest
@@ -10,11 +11,11 @@ from lumisync.pixeldash import cli
 from lumisync.pixeldash.collector import collect
 from lumisync.pixeldash.events import EventKind
 from lumisync.pixeldash.feeds.base import FeedError, TradeFeed
-from lumisync.pixeldash.models import DataClass
+from lumisync.pixeldash.models import DataClass, market_tz
 from lumisync.pixeldash.service import PixelDashService
 from lumisync.pixeldash.sinks.base import Sink, SinkReport
 
-from pixeldash_fixtures import MOMENT, config, position, trade
+from pixeldash_fixtures import MOMENT, config, position, trade, trade_today
 
 
 class StubFeed(TradeFeed):
@@ -206,10 +207,16 @@ class ServiceTests(unittest.TestCase):
             service.close()
 
     def test_journal_notes_reach_the_snapshot(self):
-        service = self.service([StubFeed("tradier", trades=[trade(100.0)])])
+        # Dated to the real clock, not the fixed fixture moment: the collector
+        # stamps snapshots with the current date, so a trade pinned to a fixed
+        # day stops being "today" as soon as the calendar moves past it.
+        service = self.service([StubFeed("tradier", trades=[trade_today(100.0)])])
         try:
-            service.journal.set(MOMENT.date(), "held the runner")
+            today = service.config and _dt.datetime.now(tz=market_tz()).date()
+            service.journal.set(today, "held the runner")
             tick = service.refresh(publish=False)
+
+            self.assertIsNotNone(tick.snapshot.today, "the trade should land on today")
             self.assertEqual(tick.snapshot.today.note, "held the runner")
         finally:
             service.close()
