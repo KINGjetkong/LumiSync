@@ -1,5 +1,9 @@
 # Get the dashboard on your Govee panel — the short version
 
+> **Want an agent on your Mac to do it instead?**
+> [AGENT_PROMPT.md](AGENT_PROMPT.md) is a copy-paste prompt for Claude Code (or
+> any coding agent) running on the machine that can reach the panel.
+
 Five steps. About ten minutes. You don't need to understand any of it.
 
 If you want to know *why* any of this is happening, that's
