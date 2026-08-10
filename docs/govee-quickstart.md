@@ -48,6 +48,17 @@ If `pip` isn't found, try `pip3`. If `git` isn't found, install it from
 
 ## Step 4 — Run the one command
 
+**Fastest option — no questions at all:**
+
+```bash
+python tools/govee_pixel_probe.py report --ip 192.168.4.68
+```
+
+Runs every check by itself and prints one block. Copy the whole thing, send it
+to me, done. Watch the panel while it runs and tell me if any colour appeared.
+
+**Or the guided version**, which asks you what you saw:
+
 ```bash
 python tools/govee_pixel_probe.py wizard
 ```

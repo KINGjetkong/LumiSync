@@ -803,6 +803,114 @@ def command_parse(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_report(args: argparse.Namespace) -> int:
+    """Run every diagnostic without asking anything, and print one paste-able block.
+
+    This exists because the person who can reach the panel and the person
+    debugging the protocol are not on the same network — and cannot be. The
+    panel only answers hosts on its own LAN, so the whole diagnostic has to run
+    there and travel back as text.
+
+    Nothing here needs a decision from the operator: it measures state from the
+    device itself rather than asking what they saw.
+    """
+    lines: List[str] = []
+
+    def say(text: str = "") -> None:
+        print(text)
+        lines.append(text)
+
+    say("===== GOVEE PIXEL PANEL REPORT =====")
+    say(f"platform: {sys.platform}  python: {sys.version.split()[0]}")
+    say(f"interfaces: {', '.join(local_ipv4_addresses()) or 'none found'}")
+    say()
+
+    # --- find it ---
+    ip = args.ip
+    if ip:
+        say(f"target: {ip} (given)")
+    else:
+        say("scanning…")
+        found = _multicast_scan(args.timeout) or sweep_subnet(args.timeout)
+        if not found:
+            say("RESULT: no device answered. Nothing else can run.")
+            say("  Check: VPN off, LAN Control on, same Wi-Fi as the panel.")
+            _write_report(args.save, lines)
+            return 1
+        for candidate, data in sorted(found.items()):
+            say(f"  found {data.get('sku', '?')} at {candidate}")
+        ip = sorted(found)[0]
+        say(f"target: {ip}")
+    say()
+
+    # --- does it answer at all ---
+    before = read_status(ip)
+    say(f"status before: {json.dumps(before) if before else 'NO REPLY'}")
+    if before is None:
+        say("RESULT: the panel does not answer status requests.")
+        say("  Everything below would be guesswork, so it is skipped.")
+        _write_report(args.save, lines)
+        return 1
+
+    # --- do basic commands land ---
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def send(message: Dict[str, Any]) -> None:
+        sock.sendto(json.dumps(message).encode(), (ip, CONTROL_PORT))
+
+    try:
+        ok, detail = verify_control(ip, send)
+        say(f"basic control: {'YES' if ok else 'NO'} — {detail}")
+        say()
+
+        # --- do any pixel encodings land ---
+        say("pixel encodings (each floods the panel, then state is re-read):")
+        grid = [[(255, 0, 0)] * args.cols for _ in range(args.rows)]
+
+        send(control_message(build_mode_frame(True)))
+        time.sleep(0.4)
+
+        for name in STRATEGIES:
+            baseline = read_status(ip)
+            frames = encode_grid(grid, name)
+            for index, frame in enumerate(frames):
+                send(control_message(frame))
+                if index + 1 < len(frames):
+                    time.sleep(0.002)
+            time.sleep(1.2)
+            after = read_status(ip)
+
+            changed = bool(baseline and after and after != baseline)
+            say(
+                f"  {name:<9} {len(frames):>3} packet(s)  "
+                f"state {'CHANGED' if changed else 'unchanged'}"
+                + (f"  -> {json.dumps(after)}" if changed else "")
+            )
+
+        send(control_message(build_mode_frame(False)))
+    finally:
+        sock.close()
+
+    say()
+    say("===== END REPORT =====")
+    say("Send this whole block back. Also watch the panel while it runs —")
+    say("if any colour appeared, say which line it happened on.")
+
+    _write_report(args.save, lines)
+    return 0
+
+
+def _write_report(path: str, lines: List[str]) -> None:
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+        print(f"\n(also saved to {path})")
+    except OSError:
+        pass
+
+
 def command_wizard(args: argparse.Namespace) -> int:
     """Walk the whole experiment start to finish, asking plain questions."""
     print("=" * 62)
@@ -1026,6 +1134,16 @@ def build_parser() -> argparse.ArgumentParser:
     wizard.add_argument("--pace", type=float, default=2.0, help="ms between packets")
     wizard.add_argument("--hold", type=float, default=3.0, help="seconds to show each attempt")
     wizard.set_defaults(func=command_wizard)
+
+    report = sub.add_parser(
+        "report", help="run every check automatically and print one block to send back"
+    )
+    report.add_argument("--ip", default="", help="skip discovery and use this address")
+    report.add_argument("--cols", type=int, default=52)
+    report.add_argument("--rows", type=int, default=32)
+    report.add_argument("--timeout", type=float, default=4.0)
+    report.add_argument("--save", default="govee-report.txt")
+    report.set_defaults(func=command_report)
 
     scan = sub.add_parser("scan", help="discover Govee devices on the LAN")
     scan.add_argument("--timeout", type=float, default=3.0)
