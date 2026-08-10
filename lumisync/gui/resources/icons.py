@@ -49,6 +49,7 @@ class IconKey(str, Enum):
     PLAY = "play"
     STOP = "stop"
     DRAW = "draw"
+    DASHBOARD = "dashboard"
 
     # Controls
     SUN = "sun"
@@ -70,6 +71,7 @@ _ICON_FILES: Dict[IconKey, str] = {
     IconKey.PLAY: "play.svg",
     IconKey.STOP: "stop.svg",
     IconKey.DRAW: "pencil.svg",
+    IconKey.DASHBOARD: "dashboard.svg",
     IconKey.SUN: "sun.svg",
     IconKey.THERMOMETER: "thermometer.svg",
 }

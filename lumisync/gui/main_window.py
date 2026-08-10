@@ -86,6 +86,7 @@ class LumiSyncMainWindow(QMainWindow):
         from .views.devices_view import DevicesView
         from .views.draw_view import DrawView
         from .views.modes_view import ModesView
+        from .views.pixeldash_view import PixelDashView
         from .views.settings_page import SettingsPage
 
         self.devices_view = DevicesView(self.device_controller)
@@ -99,6 +100,7 @@ class LumiSyncMainWindow(QMainWindow):
         # used it before Monitor and Music became first-class destinations.
         self.modes_view = self.monitor_sync_view
         self.draw_view = DrawView(self.device_controller)
+        self.pixeldash_view = PixelDashView(self.device_controller, self.settings)
 
         # A compact Fluent-style rail keeps navigation available without
         # competing with device content. Labels remain in tooltips and the
@@ -135,6 +137,12 @@ class LumiSyncMainWindow(QMainWindow):
             icon=app_icon(IconKey.DRAW), widget=self.draw_view,
         )
         self.nav_shell.set_page_svg("draw", "pencil.svg")
+
+        self.nav_shell.add_page(
+            key="pixeldash", title="Pixel Dash",
+            icon=app_icon(IconKey.DASHBOARD), widget=self.pixeldash_view,
+        )
+        self.nav_shell.set_page_svg("pixeldash", "dashboard.svg")
 
         self.settings_page = SettingsPage(self.settings, self)
         self.nav_shell.add_page(
@@ -343,6 +351,14 @@ class LumiSyncMainWindow(QMainWindow):
         if draw_view is not None:
             try:
                 draw_view._stop_send()
+            except Exception:
+                pass
+        pixeldash_view = getattr(self, "pixeldash_view", None)
+        if pixeldash_view is not None:
+            try:
+                # The hover overlay and ghost window are top-level; without this
+                # they outlive the main window and keep the app alive.
+                pixeldash_view.shutdown()
             except Exception:
                 pass
         # Close any persistent BLE connections.
