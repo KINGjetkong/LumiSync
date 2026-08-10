@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import base64
 import json
+import pathlib
+import sys
 import unittest
 
 from lumisync.drivers.govee_pixel import (
@@ -35,6 +37,8 @@ from lumisync.drivers.govee_pixel import (
     _parse_size,
 )
 from lumisync.drivers.registry import GOVEE_PIXEL_SKUS, create_adapter, is_govee_pixel_panel
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "tools"))
 
 PANEL_COLS, PANEL_ROWS = 52, 32
 
@@ -387,3 +391,95 @@ class MatrixSinkIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PcapParsingTests(unittest.TestCase):
+    """Reading a capture is the only way to see what the Govee app sends.
+
+    A UDP bind observes only packets addressed to this machine, so it can never
+    show another process's outbound traffic — which is exactly the traffic that
+    answers the protocol question.
+    """
+
+    @staticmethod
+    def _pcap(payload: bytes, link_type: int = 1) -> bytes:
+        import struct
+
+        udp_length = 8 + len(payload)
+        udp = struct.pack(">HHHH", 54321, 4003, udp_length, 0) + payload
+        ip = struct.pack(
+            ">BBHHHBBH4s4s",
+            0x45, 0, 20 + udp_length, 1, 0, 64, 17, 0,
+            bytes((192, 168, 4, 10)), bytes((192, 168, 4, 68)),
+        )
+        link = b"\x00" * 12 + struct.pack(">H", 0x0800) if link_type == 1 else b""
+        frame = link + ip + udp
+
+        header = struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, link_type)
+        record = struct.pack("<IIII", 0, 0, len(frame), len(frame))
+        return header + record + frame
+
+    def _write(self, blob: bytes) -> str:
+        import tempfile
+
+        handle = tempfile.NamedTemporaryFile(suffix=".pcap", delete=False)
+        handle.write(blob)
+        handle.close()
+        self.addCleanup(lambda: __import__("os").unlink(handle.name))
+        return handle.name
+
+    def test_a_govee_command_is_recovered_from_a_capture(self):
+        from govee_pixel_probe import parse_pcap
+
+        payload = json.dumps(control_message(build_mode_frame(True))).encode()
+        packets = parse_pcap(self._write(self._pcap(payload)))
+
+        self.assertEqual(len(packets), 1)
+        source, destination, recovered = packets[0]
+        self.assertEqual(source, "192.168.4.10:54321")
+        self.assertEqual(destination, "192.168.4.68:4003")
+        self.assertEqual(json.loads(recovered.decode())["msg"]["cmd"], "razer")
+
+    def test_the_frame_inside_a_captured_packet_decodes(self):
+        from govee_pixel_probe import parse_pcap
+
+        payload = json.dumps(control_message(build_mode_frame(True))).encode()
+        _source, _destination, recovered = parse_pcap(self._write(self._pcap(payload)))[0]
+
+        pt = json.loads(recovered.decode())["msg"]["data"]["pt"]
+        frame = decode_pt(pt)
+        self.assertIsNotNone(frame)
+        self.assertTrue(frame.checksum_ok)
+        self.assertTrue(frame.length_ok)
+
+    def test_raw_ip_link_type_is_handled(self):
+        from govee_pixel_probe import parse_pcap
+
+        payload = json.dumps({"msg": {"cmd": "status", "data": {}}}).encode()
+        packets = parse_pcap(self._write(self._pcap(payload, link_type=101)))
+        self.assertEqual(len(packets), 1)
+
+    def test_a_non_pcap_file_is_refused_with_a_useful_message(self):
+        from govee_pixel_probe import parse_pcap
+
+        with self.assertRaises(ValueError) as caught:
+            parse_pcap(self._write(b"this is not a pcap at all"))
+        self.assertIn("tcpdump", str(caught.exception))
+
+    def test_non_udp_traffic_is_skipped(self):
+        from govee_pixel_probe import parse_pcap
+
+        import struct
+
+        # A TCP packet — protocol 6 — must not be reported as a UDP payload.
+        ip = struct.pack(
+            ">BBHHHBBH4s4s", 0x45, 0, 40, 1, 0, 64, 6, 0,
+            bytes((10, 0, 0, 1)), bytes((10, 0, 0, 2)),
+        )
+        frame = b"\x00" * 12 + struct.pack(">H", 0x0800) + ip + b"\x00" * 20
+        blob = (
+            struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1)
+            + struct.pack("<IIII", 0, 0, len(frame), len(frame))
+            + frame
+        )
+        self.assertEqual(parse_pcap(self._write(blob)), [])

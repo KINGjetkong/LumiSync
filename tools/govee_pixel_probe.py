@@ -75,6 +75,258 @@ STATUS_REQUEST = {"msg": {"cmd": "status", "data": {}}}
 
 # --- helpers ------------------------------------------------------------
 
+def local_ipv4_addresses() -> List[str]:
+    """Every IPv4 address this machine holds, best effort.
+
+    Multicast leaves by exactly one interface — whichever the default route
+    picks. On a laptop with a VPN up that is the tunnel, so a scan sent the
+    obvious way goes into the tunnel and never touches the LAN the panel is on.
+    Sending from every interface is what makes discovery survive that.
+
+    ``ifconfig``/``ip``/``ipconfig`` are parsed because the alternative is a
+    dependency, and this is a diagnostic tool where a best-effort list plus a
+    manual ``--ip`` escape hatch is enough.
+    """
+    found: List[str] = []
+
+    # The address the default route would use. No packet is actually sent.
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("8.8.8.8", 80))
+        found.append(probe.getsockname()[0])
+    except OSError:
+        pass
+    finally:
+        probe.close()
+
+    import re
+    import subprocess
+
+    for command in (["ifconfig"], ["ip", "-4", "addr"], ["ipconfig"]):
+        try:
+            output = subprocess.run(
+                command, capture_output=True, text=True, timeout=5, check=False
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if not output:
+            continue
+        for match in re.findall(r"(?:inet |IPv4 Address[.\s]*: )(\d+\.\d+\.\d+\.\d+)", output):
+            if not match.startswith("127."):
+                found.append(match)
+        break
+
+    ordered: List[str] = []
+    for address in found:
+        if address not in ordered:
+            ordered.append(address)
+    return ordered
+
+
+def _multicast_scan(timeout: float) -> Dict[str, Dict[str, Any]]:
+    """Send the discovery request out of every interface and collect replies."""
+    listener = _bind(LISTEN_PORT, timeout)
+    payload = json.dumps(SCAN_REQUEST).encode()
+    interfaces = local_ipv4_addresses()
+
+    try:
+        for source in interfaces or [""]:
+            sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+            try:
+                if source:
+                    sender.setsockopt(
+                        socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(source)
+                    )
+                sender.sendto(payload, (MULTICAST_ADDR, MULTICAST_PORT))
+            except OSError:
+                # An interface that refuses multicast is normal (VPN tunnels,
+                # bridges). Keep going; another one may carry it.
+                pass
+            finally:
+                sender.close()
+
+        return _collect_replies(listener, timeout)
+    finally:
+        listener.close()
+
+
+def sweep_subnet(timeout: float = 4.0) -> Dict[str, Dict[str, Any]]:
+    """Ask every address on the local /24 for its status.
+
+    The fallback when multicast is blocked — by a VPN, by an access point with
+    client isolation, or by a router that will not forward it. Slower and
+    louder, but it only needs ordinary unicast, which survives all three.
+
+    One socket bound to 4002 sends every probe and then listens, because this
+    device family answers a status request sent *from* that port and ignores one
+    from an ephemeral port.
+    """
+    sock = _bind(LISTEN_PORT, timeout)
+    payload = json.dumps(STATUS_REQUEST).encode()
+
+    try:
+        for base in local_ipv4_addresses():
+            prefix = base.rsplit(".", 1)[0]
+            for host in range(1, 255):
+                try:
+                    sock.sendto(payload, (f"{prefix}.{host}", CONTROL_PORT))
+                except OSError:
+                    continue
+        return _collect_replies(sock, timeout)
+    finally:
+        sock.close()
+
+
+def _collect_replies(sock: socket.socket, timeout: float) -> Dict[str, Dict[str, Any]]:
+    found: Dict[str, Dict[str, Any]] = {}
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            payload, origin = sock.recvfrom(4096)
+        except socket.timeout:
+            break
+        except OSError:
+            break
+        try:
+            message = json.loads(payload.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            continue
+        data = (message.get("msg") or {}).get("data") or {}
+        found[str(data.get("ip") or origin[0])] = data
+    return found
+
+
+# --- packet capture -----------------------------------------------------
+#
+# `watch` binds UDP 4002 and therefore only ever sees packets addressed to this
+# machine — the panel's replies. It structurally cannot see what the Govee app
+# sends, which is the traffic that actually answers the question. Capturing at
+# the link layer is the only way to read another process's outbound packets, so
+# that is what these do.
+
+PCAP_MAGICS = {
+    0xA1B2C3D4: ("<", False),   # classic, microseconds
+    0xD4C3B2A1: (">", False),
+    0xA1B23C4D: ("<", True),    # nanoseconds
+    0x4D3CB2A1: (">", True),
+}
+#: Link-layer header sizes we can skip past. 0 is BSD loopback, 1 Ethernet,
+#: 101 raw IP, 113 Linux "any".
+LINK_HEADER_BYTES = {0: 4, 1: 14, 101: 0, 113: 16, 276: 20}
+
+
+def parse_pcap(path: str) -> List[Tuple[str, str, bytes]]:
+    """Extract ``(source, destination, payload)`` for every UDP packet.
+
+    Classic pcap only — that is what ``tcpdump -w`` writes by default, and
+    handling pcapng too would be a parser for a format we never ask anyone to
+    produce.
+    """
+    import struct
+
+    with open(path, "rb") as handle:
+        blob = handle.read()
+
+    if len(blob) < 24:
+        raise ValueError("file is too short to be a pcap")
+
+    magic = struct.unpack("<I", blob[:4])[0]
+    if magic not in PCAP_MAGICS:
+        magic = struct.unpack(">I", blob[:4])[0]
+    if magic not in PCAP_MAGICS:
+        raise ValueError(
+            "not a classic pcap file. Capture with: tcpdump -w capture.pcap"
+        )
+
+    endian, _nanos = PCAP_MAGICS[magic]
+    link_type = struct.unpack(endian + "I", blob[20:24])[0]
+    link_bytes = LINK_HEADER_BYTES.get(link_type)
+    if link_bytes is None:
+        raise ValueError(f"unsupported link type {link_type}")
+
+    packets: List[Tuple[str, str, bytes]] = []
+    offset = 24
+    while offset + 16 <= len(blob):
+        _sec, _usec, captured, _original = struct.unpack(
+            endian + "IIII", blob[offset : offset + 16]
+        )
+        offset += 16
+        frame = blob[offset : offset + captured]
+        offset += captured
+        parsed = _parse_udp(frame, link_bytes, link_type)
+        if parsed is not None:
+            packets.append(parsed)
+    return packets
+
+
+def _parse_udp(frame: bytes, link_bytes: int, link_type: int) -> Optional[Tuple[str, str, bytes]]:
+    """Pull a UDP payload out of one captured link-layer frame."""
+    import struct
+
+    if link_type == 1 and len(frame) >= 14:
+        # Ethernet: only IPv4 carries what we want.
+        if struct.unpack(">H", frame[12:14])[0] != 0x0800:
+            return None
+
+    packet = frame[link_bytes:]
+    if len(packet) < 20 or (packet[0] >> 4) != 4:
+        return None
+
+    header_length = (packet[0] & 0x0F) * 4
+    if packet[9] != 17 or len(packet) < header_length + 8:  # 17 = UDP
+        return None
+
+    source = ".".join(str(byte) for byte in packet[12:16])
+    destination = ".".join(str(byte) for byte in packet[16:20])
+    udp = packet[header_length:]
+    source_port, destination_port, length, _checksum = struct.unpack(">HHHH", udp[:8])
+
+    payload = udp[8 : max(8, length)]
+    return (f"{source}:{source_port}", f"{destination}:{destination_port}", payload)
+
+
+def _not_found_help(ip_hint: str = "") -> None:
+    """Print every real cause, in the order they actually happen."""
+    is_mac = sys.platform == "darwin"
+
+    print("  I could not find any Govee device on this network.\n")
+    print("  Work through these in order:\n")
+
+    step = 1
+    if is_mac:
+        # Recent macOS blocks LAN traffic per-app until it is allowed, and it
+        # fails *silently* — packets simply go nowhere. On a Mac this is the
+        # single most likely cause, ahead of anything about the panel.
+        print(f"   {step}. macOS is probably blocking this. It does that silently.")
+        print("      System Settings -> Privacy & Security -> Local Network")
+        print("      Turn ON the switch for Terminal (or iTerm/VS Code, whichever")
+        print("      you are running this in). Then run this again.\n")
+        step += 1
+
+    print(f"   {step}. Is a VPN on? Turn it off.")
+    print("      Discovery goes out the tunnel instead of your Wi-Fi.\n")
+    step += 1
+
+    print(f"   {step}. LAN Control still off?")
+    print("      Govee Home app -> your panel -> settings -> 'LAN Control' ON\n")
+    step += 1
+
+    print(f"   {step}. Same Wi-Fi? Not guest Wi-Fi.")
+    print("      If your router splits 2.4GHz and 5GHz, the panel is on 2.4GHz.\n")
+    step += 1
+
+    print(f"   {step}. Just skip discovery — this always works:")
+    print("      Find the panel's IP (Govee Home -> device -> settings -> about,")
+    print("      or your router's device list), then run:\n")
+    print(f"        python tools/govee_pixel_probe.py wizard --ip {ip_hint or '192.168.1.50'}\n")
+
+    addresses = local_ipv4_addresses()
+    if addresses:
+        print(f"  (This computer is at: {', '.join(addresses)} — the panel will")
+        print("   have an address that looks similar.)")
+
+
 def _bind(port: int, timeout: float) -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -159,36 +411,17 @@ def _frame_bodies(records: List[Dict[str, Any]]) -> List[bytes]:
 # --- commands -----------------------------------------------------------
 
 def command_scan(args: argparse.Namespace) -> int:
-    """Multicast-discover Govee devices and print what answers."""
-    print(f"Broadcasting scan to {MULTICAST_ADDR}:{MULTICAST_PORT}, listening on {LISTEN_PORT}…")
+    """Discover Govee devices, falling back to a subnet sweep."""
+    print(f"Broadcasting scan from every interface, listening on {LISTEN_PORT}…")
 
-    listener = _bind(LISTEN_PORT, args.timeout)
-    sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-
-    found: Dict[str, Dict[str, Any]] = {}
-    try:
-        sender.sendto(json.dumps(SCAN_REQUEST).encode(), (MULTICAST_ADDR, MULTICAST_PORT))
-        deadline = time.monotonic() + args.timeout
-        while time.monotonic() < deadline:
-            try:
-                payload, origin = listener.recvfrom(4096)
-            except socket.timeout:
-                break
-            try:
-                message = json.loads(payload.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
-                continue
-            data = (message.get("msg") or {}).get("data") or {}
-            ip = str(data.get("ip") or origin[0])
-            found[ip] = data
-    finally:
-        listener.close()
-        sender.close()
+    found = _multicast_scan(args.timeout)
+    if not found:
+        print("Multicast found nothing. Sweeping the local subnet directly…")
+        found = sweep_subnet(args.timeout)
 
     if not found:
-        print("\nNothing answered.")
-        print("Most likely: LAN Control is off. Govee Home -> device -> settings -> LAN Control.")
+        print()
+        _not_found_help()
         return 1
 
     print(f"\n{len(found)} device(s):\n")
@@ -207,9 +440,8 @@ def command_status(args: argparse.Namespace) -> int:
         sock.sendto(json.dumps(STATUS_REQUEST).encode(), (args.ip, CONTROL_PORT))
         payload, origin = sock.recvfrom(4096)
     except socket.timeout:
-        print(f"No reply from {args.ip}:{CONTROL_PORT} within {args.timeout:g}s.")
-        print("The capture notes this family only answers a probe sent FROM port 4002,")
-        print("which this command does — so a timeout here usually means LAN Control is off.")
+        print(f"No reply from {args.ip}:{CONTROL_PORT} within {args.timeout:g}s.\n")
+        _not_found_help(args.ip)
         return 1
     finally:
         sock.close()
@@ -405,6 +637,65 @@ WIZARD_COLORS: List[Tuple[str, Tuple[int, int, int]]] = [
 ]
 
 
+def read_status(ip: str, timeout: float = 2.0) -> Optional[Dict[str, Any]]:
+    """Read a device's reported state, or None if it does not answer.
+
+    Bound to 4002 because this family answers a status request sent *from* that
+    port and ignores one from an ephemeral port.
+    """
+    try:
+        sock = _bind(LISTEN_PORT, timeout)
+    except OSError:
+        return None
+    try:
+        sock.sendto(json.dumps(STATUS_REQUEST).encode(), (ip, CONTROL_PORT))
+        payload, _origin = sock.recvfrom(4096)
+        message = json.loads(payload.decode("utf-8"))
+        data = (message.get("msg") or {}).get("data")
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    finally:
+        sock.close()
+
+
+def verify_control(ip: str, send) -> Tuple[bool, str]:
+    """Prove commands are landing by reading the device's own state back.
+
+    Asking "did it look brighter" fails badly when the panel was already on and
+    already bright — the honest answer is "no" even though the command worked.
+    Reading ``onOff``/``brightness`` back turns that into a fact instead of a
+    judgement call, so the wizard stops guessing about the operator's eyes.
+    """
+    before = read_status(ip)
+    if before is None:
+        return False, "the panel is not answering status requests at all"
+
+    # Drive it somewhere it demonstrably is not, then read back.
+    was_on = str(before.get("onOff", "")) in ("1", "True", "true")
+    target_brightness = 30 if int(before.get("brightness") or 0) > 60 else 100
+
+    send({"msg": {"cmd": "turn", "data": {"value": 0 if was_on else 1}}})
+    time.sleep(1.0)
+    send({"msg": {"cmd": "turn", "data": {"value": 1}}})
+    send({"msg": {"cmd": "brightness", "data": {"value": target_brightness}}})
+    time.sleep(1.5)
+
+    after = read_status(ip)
+    if after is None:
+        return False, "the panel stopped answering after the commands"
+
+    if after.get("brightness") != before.get("brightness") or after.get("onOff") != before.get("onOff"):
+        return True, (
+            f"confirmed — brightness {before.get('brightness')} -> {after.get('brightness')}, "
+            f"power {before.get('onOff')} -> {after.get('onOff')}"
+        )
+    return False, (
+        f"the panel answers, but ignored the commands "
+        f"(still brightness={after.get('brightness')}, power={after.get('onOff')})"
+    )
+
+
 def _ask(question: str, default: bool = False) -> bool:
     suffix = "[Y/n]" if default else "[y/N]"
     try:
@@ -422,6 +713,94 @@ def _pause(message: str = "Press Enter when ready… ") -> None:
         input(message)
     except (EOFError, KeyboardInterrupt):
         print()
+
+
+def command_sniff(args: argparse.Namespace) -> int:
+    """Capture Govee traffic at the link layer, then decode it.
+
+    Needs sudo, because reading another process's packets is a privileged
+    operation on every OS. This is the only way to see what the Govee app
+    sends — a UDP bind can only ever observe traffic addressed to this machine.
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("tcpdump") is None:
+        print("tcpdump not found.")
+        print("  macOS: it ships with the system.")
+        print("  Linux: sudo apt install tcpdump")
+        print("  Windows: use Wireshark, save as .pcap, then run:")
+        print("    python tools/govee_pixel_probe.py parse <file.pcap>")
+        return 1
+
+    filter_expression = "udp port 4001 or udp port 4002 or udp port 4003"
+    command = ["sudo", "tcpdump", "-i", args.interface, "-s", "0", "-w", args.save, filter_expression]
+
+    print("Capturing Govee traffic. You'll be asked for your Mac password.\n")
+    print("  While it runs: open the Govee app and show a picture on the panel.")
+    print("  Change a colour, open a DIY scene — anything visual.\n")
+    print("  Then press Ctrl-C here.\n")
+    print(f"  ({' '.join(command)})\n")
+
+    try:
+        subprocess.run(command, check=False)
+    except KeyboardInterrupt:
+        pass
+    except OSError as exc:
+        print(f"Could not run tcpdump: {exc}")
+        return 1
+
+    print()
+    return command_parse(argparse.Namespace(path=args.save, verbose=args.verbose))
+
+
+def command_parse(args: argparse.Namespace) -> int:
+    """Decode a pcap: show every Govee message and every pixel frame in it."""
+    try:
+        packets = parse_pcap(args.path)
+    except (OSError, ValueError) as exc:
+        print(f"Could not read {args.path}: {exc}")
+        return 1
+
+    if not packets:
+        print(f"No UDP packets in {args.path}.")
+        print("\nIf you drove the panel from your PHONE, that traffic never touches")
+        print("this computer — a capture here cannot see it. Either:")
+        print("  - use the Govee DESKTOP app on this machine while capturing, or")
+        print("  - capture on the machine running the Govee app.")
+        return 1
+
+    print(f"{len(packets)} UDP packet(s) in {args.path}\n")
+    frames_found = 0
+
+    for source, destination, payload in packets:
+        try:
+            message = json.loads(payload.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            if args.verbose:
+                print(f"  {source} -> {destination}  {len(payload)}B (not JSON)")
+            continue
+
+        command = str((message.get("msg") or {}).get("cmd", "?"))
+        print(f"  {source} -> {destination}  cmd={command}")
+
+        for pt in _find_pt(message):
+            frame = decode_pt(pt)
+            frames_found += 1
+            if frame is None:
+                print(f"      pt (undecodable): {pt[:60]}")
+                continue
+            print(f"      {frame.summary}")
+            if args.verbose:
+                print(f"      full body: {frame.body.hex(' ')}")
+
+    print(f"\n{frames_found} pixel/protocol frame(s) decoded.")
+    if frames_found:
+        print("\nThis is the answer. Send me this output (or the .pcap itself).")
+    else:
+        print("\nNo 'pt' frames — the app drove the panel through the cloud, not the LAN.")
+        print("Turn on LAN Control for the panel and capture again.")
+    return 0
 
 
 def command_wizard(args: argparse.Namespace) -> int:
@@ -452,20 +831,33 @@ def command_wizard(args: argparse.Namespace) -> int:
 
     try:
         # --- step 2: prove we can talk to it at all ---
+        # Measured, not eyeballed. A panel that was already on and already
+        # bright looks identical after a "turn on and brighten" command, so
+        # asking the operator what they saw would fail a working setup.
         print("\nSTEP 2 — Checking I can control the panel.")
-        print("Watch it now — it should turn on and go bright.\n")
-        send({"msg": {"cmd": "turn", "data": {"value": 1}}})
-        time.sleep(0.5)
-        send({"msg": {"cmd": "brightness", "data": {"value": 100}}})
-        time.sleep(1.5)
+        print("It should blink off and back on. Reading its state to be sure…\n")
 
-        if not _ask("Did the panel turn on / get brighter?", default=True):
-            print("\nSo basic control is not getting through. Fix that first:")
-            print("  Govee Home app -> your panel -> settings -> turn ON 'LAN Control'")
-            print("  Also check this computer is on the same Wi-Fi as the panel.")
-            print("\nThen run this again.")
-            return 1
-        print("\n  Good — basic control works. Now the real test.\n")
+        ok, detail = verify_control(ip, send)
+        print(f"  {detail}\n")
+
+        if not ok:
+            if "not answering" in detail:
+                print("  It answered discovery but not a direct status request.")
+                print("  Usually the panel is at a different address than it advertised.")
+                print("  Check your router for the panel's real IP, then:\n")
+                print("    python tools/govee_pixel_probe.py wizard --ip <that address>\n")
+                return 1
+
+            print("  The panel is reachable but ignoring commands. Two usual causes:\n")
+            print("   1. It is running a scene/mode from the app that overrides")
+            print("      external control. Set it to a plain solid colour in Govee")
+            print("      Home first, then run this again.")
+            print("   2. It is a model that only accepts LAN commands while the app")
+            print("      is closed. Force-quit Govee Home and retry.\n")
+            if not _ask("  Try the picture tests anyway?", default=True):
+                return 1
+        else:
+            print("  Good — commands are landing. Now the real test.\n")
 
         # --- step 3: which encoding reaches the panel ---
         print("-" * 62)
@@ -540,42 +932,30 @@ def command_wizard(args: argparse.Namespace) -> int:
 
 def _wizard_find_panel(timeout: float) -> str:
     """Discover the panel, or explain in plain words why nothing answered."""
-    listener = _bind(LISTEN_PORT, timeout)
-    sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-
-    found: Dict[str, Dict[str, Any]] = {}
-    try:
-        sender.sendto(json.dumps(SCAN_REQUEST).encode(), (MULTICAST_ADDR, MULTICAST_PORT))
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                payload, origin = listener.recvfrom(4096)
-            except socket.timeout:
-                break
-            try:
-                message = json.loads(payload.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
-                continue
-            data = (message.get("msg") or {}).get("data") or {}
-            found[str(data.get("ip") or origin[0])] = data
-    finally:
-        listener.close()
-        sender.close()
+    found = _multicast_scan(timeout)
+    if not found:
+        print("  Nothing answered the broadcast. Trying every address directly…")
+        found = sweep_subnet(timeout)
 
     if not found:
-        print("  I could not find any Govee device on this network.\n")
-        print("  Almost always one of these two things:\n")
-        print("   1. LAN Control is off.")
-        print("      Govee Home app -> your panel -> settings -> turn ON 'LAN Control'")
-        print("   2. This computer is on a different Wi-Fi than the panel.")
-        print("      (Guest networks and 5GHz-vs-2.4GHz splits both cause this.)\n")
-        print("  Fix that, then run this again.")
+        print()
+        _not_found_help()
         return ""
 
     if len(found) == 1:
         ip = next(iter(found))
-        print(f"  Found it: {found[ip].get('sku', 'device')} at {ip}")
+        sku = str(found[ip].get("sku", "") or "device")
+        print(f"  Found it: {sku} at {ip}")
+        # Auto-picking the only device is convenient but wrong if that device
+        # is a strip and the panel never answered — say what it is so a bad
+        # pick is obvious rather than silent.
+        if sku.upper() not in ("H6631",) and sku != "device":
+            print(f"\n  Heads up: {sku} is not the pixel panel model I know about.")
+            if not _ask(f"  Is {sku} your pixel panel?", default=True):
+                print("\n  Then the panel did not answer. Find its IP in your router")
+                print("  or the Govee app, and run:")
+                print("    python tools/govee_pixel_probe.py wizard --ip <that address>")
+                return ""
         return ip
 
     print(f"  Found {len(found)} devices:\n")
@@ -661,6 +1041,19 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--ip", default="", help="only log packets from this address")
     watch.add_argument("--save", default="", help="append decoded records to this JSONL file")
     watch.set_defaults(func=command_watch)
+
+    sniff = sub.add_parser(
+        "sniff", help="capture what the Govee APP sends (needs sudo) and decode it"
+    )
+    sniff.add_argument("--interface", default="any", help="network interface (macOS: en0)")
+    sniff.add_argument("--save", default="govee.pcap")
+    sniff.add_argument("--verbose", action="store_true")
+    sniff.set_defaults(func=command_sniff)
+
+    parse_cmd = sub.add_parser("parse", help="decode a .pcap you already captured")
+    parse_cmd.add_argument("path")
+    parse_cmd.add_argument("--verbose", action="store_true")
+    parse_cmd.set_defaults(func=command_parse)
 
     decode = sub.add_parser("decode", help="decode base64 pt payloads")
     decode.add_argument("payloads", nargs="+")

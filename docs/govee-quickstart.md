@@ -83,15 +83,49 @@ Once I have it, the panel streams your live dashboard.
 
 ---
 
+## If the panel ignores commands
+
+If the wizard says the panel answers but **ignores** commands, or you saw no
+colours at all, the panel speaks a different dialect than Govee's strips. One
+capture settles it.
+
+**Important:** driving the panel from your **phone** won't work here — that
+traffic never touches your Mac, so nothing can record it. Use the **Govee
+desktop app on this computer**, or capture on whichever machine runs the app.
+
+```bash
+python tools/govee_pixel_probe.py sniff
+```
+
+It asks for your password (recording network traffic needs it), then:
+
+1. While it runs, open the Govee **desktop** app and show a picture on the panel
+2. Press **Ctrl-C**
+3. It prints what it found — send me that, or send `govee.pcap`
+
+Already have a Wireshark capture? Skip straight to:
+
+```bash
+python tools/govee_pixel_probe.py parse yourfile.pcap
+```
+
+---
+
 ## If it goes wrong
 
 **"command not found: python"** → try `python3` instead of `python`.
 
-**"I could not find any Govee device"** → Step 1 didn't take, or you're on a
-different Wi-Fi than the panel. Those are the only two causes.
+**"I could not find any Govee device"** → in order: (1) VPN on — turn it off,
+it swallows discovery; (2) macOS blocking local network — System Settings →
+Privacy & Security → **Local Network** → enable Terminal; (3) LAN Control still
+off; (4) different Wi-Fi.
 
-**"Did the panel turn on?" and it didn't** → same as above. The wizard stops
-there on purpose, because nothing after it can work.
+Or skip discovery entirely — find the panel's IP in your router and run
+`python tools/govee_pixel_probe.py wizard --ip 192.168.4.68`
+
+**Panel ignores commands** → see the section above. Also worth trying: set the
+panel to a plain solid colour in the Govee app first (a running scene can
+override outside control), and force-quit the Govee app.
 
 **Panel is somewhere you can't see it** → move it, or run the wizard with the
 panel's address so you can walk to it:
